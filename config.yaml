@@ -1,0 +1,103 @@
+# L-JEPA Configuration
+
+gym:
+  # Path to the f1tenth_gym repo (old gym API)
+  gym_path: /home/pragya/f1tenth_gym
+  timestep: 0.01
+  integrator: RK4  # or Euler
+  num_beams: 1080
+  fov: 4.7  # radians (~269 degrees)
+
+maps:
+  # Maps available in the old gym. 'levine' needs a png (not present).
+  - name: berlin
+    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/berlin
+    map_ext: .png
+    start_pose: [0.0, 0.0, 1.37]   # [x, y, theta]
+  - name: skirk
+    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/skirk
+    map_ext: .png
+    start_pose: [0.0, 0.0, 0.0]
+  - name: vegas
+    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/vegas
+    map_ext: .png
+    start_pose: [0.0, 0.0, 0.0]
+  - name: stata_basement
+    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/stata_basement
+    map_ext: .png
+    start_pose: [0.0, 0.0, 0.0]
+
+data_collection:
+  output_dir: /home/pragya/ljepa/data
+  episodes_per_map: 20          # number of episodes per map
+  max_steps_per_episode: 3000   # max steps before reset
+  context_window: 4             # h: number of past scans fed to encoder
+  prediction_horizon: 5         # k: steps ahead to predict
+  min_episode_steps: 100        # discard very short episodes (collisions)
+  controller: follow_the_gap    # or pure_pursuit
+
+model:
+  # LiDAR input: 1080 beams (raw) or subsampled
+  lidar_subsample: 5            # take every Nth beam -> 1080/5 = 216 dims
+  lidar_dim: 216                # = num_beams / lidar_subsample
+  vel_dim: 2                    # [linear_vels_x, ang_vels_z]
+  obs_dim: 218                  # lidar_dim + vel_dim (per timestep)
+  context_window: 4             # h
+  action_dim: 2                 # [steer, speed]
+  latent_dim: 64                # d: encoder output dimension
+  prediction_horizon: 5         # k: steps ahead to predict (must match data_collection)
+
+  encoder:
+    channels: [32, 64, 128]     # conv1d channel progression
+    kernel_size: 5
+    stride: 2
+
+  predictor:
+    hidden_dims: [256, 256]
+
+pretrain:
+  epochs: 100
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  ema_decay: 0.996              # target encoder EMA decay
+  prediction_horizon: 5         # k
+  checkpoint_dir: /home/pragya/ljepa/checkpoints/pretrain
+  log_every: 10                 # log every N epochs
+
+rl:
+  checkpoint_dir: /home/pragya/ljepa/checkpoints/rl
+  encoder_checkpoint: /home/pragya/ljepa/checkpoints/pretrain/best.pt
+  total_steps: 2_000_000
+  rollout_steps: 2048           # steps per PPO update
+  num_envs: 1
+  lr: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  epochs_per_update: 10
+  minibatch_size: 64
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  log_every: 10                 # log every N updates
+  eval_every: 50                # run eval every N updates
+
+  reward:
+    progress_weight: 1.0        # reward per meter of track progress
+    collision_penalty: -10.0
+    velocity_bonus: 0.0         # optional: weight on forward velocity
+
+  # Training map (single map for RL)
+  map_name: berlin
+  map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/berlin
+  map_ext: .png
+  start_pose: [0.0, 0.0, 1.37]
+
+evaluate:
+  map_name: berlin
+  map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/berlin
+  map_ext: .png
+  start_pose: [0.0, 0.0, 1.37]
+  num_episodes: 10
+  render: false
