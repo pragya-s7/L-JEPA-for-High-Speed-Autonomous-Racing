@@ -96,10 +96,12 @@ class ObsBuffer:
         return self.buffer.copy()
 
 
-def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device):
+def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device, render=False):
     obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
     obs_buf.reset()
     obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
+    if render:
+        env.render(mode='human_fast')
 
     prev_pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
 
@@ -132,6 +134,9 @@ def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device):
         prev_pose = curr_pose
         step += 1
 
+        if render:
+            env.render(mode='human_fast')
+
         if collision:
             break
 
@@ -152,7 +157,7 @@ MAP_INFO = {
 }
 
 
-def eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg, num_episodes, max_steps, device):
+def eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg, num_episodes, max_steps, device, render=False):
     import gym as openai_gym
     from f110_gym.envs.base_classes import Integrator
 
@@ -176,7 +181,7 @@ def eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg, num_episodes, max_st
 
     for ep in range(num_episodes):
         t0 = time.time()
-        r = run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device)
+        r = run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device, render=render)
         elapsed = time.time() - t0
         status = 'COLLISION' if r['collided'] else 'clean    '
         print(f"  ep {ep+1:3d}: {r['steps']:5d} steps  {status}  "
@@ -207,8 +212,9 @@ def main():
     parser.add_argument('--config',   default=os.path.join(PROJECT_ROOT, 'config.yaml'))
     parser.add_argument('--encoder',  default=None)
     parser.add_argument('--policy',   default=None)
-    parser.add_argument('--maps',     nargs='+', default=['berlin'])
+    parser.add_argument('--maps',     nargs='+', default=['berlin', 'stata_basement', 'vegas'])
     parser.add_argument('--episodes', type=int, default=10)
+    parser.add_argument('--render', action='store_true', help='Show live simulation window')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -240,7 +246,8 @@ def main():
         print(f"Map: {map_name}  |  Episodes: {args.episodes}")
         print(f"{'='*60}")
         results = eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg,
-                           args.episodes, cfg['data_collection']['max_steps_per_episode'], device)
+                           args.episodes, cfg['data_collection']['max_steps_per_episode'], device,
+                           render=args.render)
         print_summary(map_name, results)
 
     print(f"\nDone.")

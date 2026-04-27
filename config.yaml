@@ -88,7 +88,27 @@ rl:
     collision_penalty: -10.0
     velocity_bonus: 0.0         # optional: weight on forward velocity
 
-  # Training map (single map for RL)
+  # Multi-map training: policy randomly picks a map each episode reset.
+  # Add levine once you have the PNG — drop it in the gym maps folder.
+  training_maps:
+    - name: berlin
+      map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/berlin
+      map_ext: .png
+      start_pose: [0.0, 0.0, 1.37]
+    - name: stata_basement
+      map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/stata_basement
+      map_ext: .png
+      start_pose: [0.0, 0.0, 0.0]
+    - name: vegas
+      map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/vegas
+      map_ext: .png
+      start_pose: [0.0, 0.0, 0.0]
+    - name: levine
+      map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/levine
+      map_ext: .png
+      start_pose: [0.0, 0.0, 0.0]   # update once you have the map
+
+  # Fallback single-map fields (used if training_maps is removed)
   map_name: berlin
   map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/berlin
   map_ext: .png
