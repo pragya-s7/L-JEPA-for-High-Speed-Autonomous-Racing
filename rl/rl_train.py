@@ -19,6 +19,7 @@ from collections import deque
 import numpy as np
 import torch
 import yaml
+from scipy.spatial import cKDTree
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -97,6 +98,55 @@ class ObsBuffer:
         return self.buffer.copy()
 
 
+class CenterlineTracker:
+    """
+    Tracks a car's arc-length progress and lateral deviation along a pre-built
+    centerline CSV (columns: s_m; x_m; y_m).
+
+    For closed-loop tracks (loop_gap < 5 m) the arc-length delta wraps around
+    correctly at the finish line.  For open-ended centerlines (e.g. stata_basement
+    where one episode doesn't cover a full lap) wrap-around is disabled and the
+    tracker simply accumulates forward progress within each episode.
+    """
+
+    _CLOSED_GAP_M = 5.0
+
+    def __init__(self, csv_path):
+        data = np.loadtxt(csv_path, delimiter=';', skiprows=1)
+        self.s = data[:, 0].astype(np.float32)
+        self.x = data[:, 1].astype(np.float32)
+        self.y = data[:, 2].astype(np.float32)
+        self.total_length = float(self.s[-1])
+        self._tree = cKDTree(np.column_stack([self.x, self.y]))
+        self._last_s = None
+
+        loop_gap = float(np.hypot(self.x[-1] - self.x[0], self.y[-1] - self.y[0]))
+        self.is_closed = loop_gap < self._CLOSED_GAP_M
+        print(f"    centerline: {len(self.s)} wp  length={self.total_length:.1f}m  "
+              f"{'closed' if self.is_closed else 'open (no wrap-around)'}")
+
+    def reset(self, x, y):
+        _, idx = self._tree.query([x, y])
+        self._last_s = float(self.s[idx])
+
+    def step(self, x, y):
+        """Returns (delta_arc_m, lateral_m)."""
+        lateral, idx = self._tree.query([x, y])
+        curr_s = float(self.s[idx])
+        if self._last_s is None:
+            self._last_s = curr_s
+            return 0.0, float(lateral)
+        delta_s = curr_s - self._last_s
+        if self.is_closed:
+            half = self.total_length / 2.0
+            if delta_s > half:
+                delta_s -= self.total_length
+            elif delta_s < -half:
+                delta_s += self.total_length
+        self._last_s = curr_s
+        return delta_s, float(lateral)
+
+
 def make_env(map_path, map_ext, timestep):
     return gym.make(
         'f110_gym:f110-v0',
@@ -108,17 +158,20 @@ def make_env(map_path, map_ext, timestep):
     )
 
 
-def compute_reward(prev_pose, curr_pose, collision, reward_cfg):
+def compute_reward(delta_arc, lateral, collision, reward_cfg):
+    """Centerline-based reward: forward arc progress minus lateral deviation."""
     if collision:
         return reward_cfg['collision_penalty']
-    dx = curr_pose[0] - prev_pose[0]
-    dy = curr_pose[1] - prev_pose[1]
-    heading = prev_pose[2]
-    progress = dx * np.cos(heading) + dy * np.sin(heading)
-    r = reward_cfg['progress_weight'] * max(progress, 0.0)
-    if reward_cfg.get('velocity_bonus', 0.0) > 0:
-        r += reward_cfg['velocity_bonus'] * np.sqrt(dx*dx + dy*dy) / 0.01
+    r = reward_cfg['progress_weight'] * delta_arc
+    r -= reward_cfg.get('deviation_weight', 0.05) * lateral
     return r
+
+
+def compute_reward_fallback(vel_x, collision, reward_cfg):
+    """vel_x fallback for maps without a centerline."""
+    if collision:
+        return reward_cfg['collision_penalty']
+    return reward_cfg['progress_weight'] * max(float(vel_x), 0.0) * 0.01
 
 
 def clamp_action(steer, speed):
@@ -137,13 +190,25 @@ def build_map_pool(cfg):
 
     training_maps = rl_cfg.get('training_maps', None)
     if not training_maps:
-        # Fallback: single map from old config
-        training_maps = [{
-            'name':       rl_cfg['map_name'],
-            'map_path':   rl_cfg['map_path'],
-            'map_ext':    rl_cfg['map_ext'],
-            'start_pose': rl_cfg['start_pose'],
-        }]
+        # Fallback: build from top-level maps list in config
+        maps_lookup = {m['name']: m for m in cfg.get('maps', [])}
+        fallback_names = ['berlin', 'stata_basement', 'vegas', 'skirk']
+        training_maps = []
+        for name in fallback_names:
+            m = maps_lookup.get(name)
+            if m:
+                training_maps.append({
+                    'name':       name,
+                    'map_path':   m['map_path'],
+                    'map_ext':    m.get('map_ext', '.png'),
+                    'start_pose': m['start_pose'],
+                })
+        if not training_maps:
+            raise RuntimeError(
+                "No training_maps found in config. Add a training_maps section to config.yaml."
+            )
+
+    centerline_dir = rl_cfg.get('centerline_dir', '')
 
     pool = []
     for m in training_maps:
@@ -154,7 +219,15 @@ def build_map_pool(cfg):
             continue
         print(f"  Loading map: {m['name']}")
         env = make_env(path, ext, timestep)
-        pool.append({'env': env, 'start_pose': m['start_pose'], 'name': m['name']})
+        entry = {'env': env, 'start_pose': m['start_pose'], 'name': m['name']}
+
+        cl_path = os.path.join(centerline_dir, f"{m['name']}_centerline.csv") if centerline_dir else ''
+        if cl_path and os.path.exists(cl_path):
+            entry['tracker'] = CenterlineTracker(cl_path)
+        else:
+            print(f"    no centerline found — using vel_x fallback reward")
+
+        pool.append(entry)
 
     if not pool:
         raise RuntimeError("No valid training maps found. Check paths in config.yaml.")
@@ -215,7 +288,9 @@ def train(cfg_path, encoder_path_override=None):
     obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
     obs_buf.reset()
     obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
-    prev_pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
+    tracker = current_map.get('tracker')
+    if tracker is not None:
+        tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
 
     total_steps = 0
     update_count = 0
@@ -239,9 +314,16 @@ def train(cfg_path, encoder_path_override=None):
             steer, speed = clamp_action(float(action_t[0, 0].cpu()), float(action_t[0, 1].cpu()))
 
             obs, _, done, _ = env.step(np.array([[steer, speed]]))
-            curr_pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
             collision = bool(obs['collisions'][0])
-            reward = compute_reward(prev_pose, curr_pose, collision, reward_cfg)
+            vel_x = float(obs['linear_vels_x'][0])
+
+            if tracker is not None:
+                delta_arc, lateral = tracker.step(
+                    float(obs['poses_x'][0]), float(obs['poses_y'][0])
+                )
+                reward = compute_reward(delta_arc, lateral, collision, reward_cfg)
+            else:
+                reward = compute_reward_fallback(vel_x, collision, reward_cfg)
 
             ppo.store(z.squeeze(0), action_t.squeeze(0), log_prob.squeeze(0),
                       reward, done, value.squeeze(0))
@@ -264,9 +346,9 @@ def train(cfg_path, encoder_path_override=None):
                 start_pose = current_map['start_pose']
                 obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
                 obs_buf.reset()
-                prev_pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
-            else:
-                prev_pose = curr_pose
+                tracker = current_map.get('tracker')
+                if tracker is not None:
+                    tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
 
             obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
 

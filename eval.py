@@ -103,8 +103,6 @@ def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device, render
     if render:
         env.render(mode='human_fast')
 
-    prev_pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
-
     total_reward = 0.0
     speeds = []
     step = 0
@@ -120,18 +118,16 @@ def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device, render
 
         obs, _, done, _ = env.step(np.array([[steer, speed]]))
         collision = bool(obs['collisions'][0])
+        vel_x = float(obs['linear_vels_x'][0])
 
-        curr_pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
-        dx = curr_pose[0] - prev_pose[0]
-        dy = curr_pose[1] - prev_pose[1]
-        heading = prev_pose[2]
-        progress = dx * np.cos(heading) + dy * np.sin(heading)
-        reward = max(progress, 0.0) if not collision else -10.0
+        if collision:
+            reward = -100.0
+        else:
+            reward = 3.0 * max(vel_x, 0.0) * 0.01 + 0.1
 
         total_reward += reward
-        speeds.append(float(obs['linear_vels_x'][0]))
-        obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
-        prev_pose = curr_pose
+        speeds.append(vel_x)
+        obs_buf.update(obs['scans'][0], vel_x, float(obs['ang_vels_z'][0]))
         step += 1
 
         if render:
