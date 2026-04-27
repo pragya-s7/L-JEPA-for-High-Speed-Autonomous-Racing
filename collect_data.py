@@ -223,7 +223,10 @@ def collect_map(map_name, map_info, gym_path, num_episodes, output_dir,
         integrator=Integrator.RK4,
     )
     from controllers import FollowTheGap
-    controller = FollowTheGap()
+    # from controllers import PurePursuit
+    from controllers import RRT
+    # controller = FollowTheGap()
+    controller = RRT()  # or FollowTheGap()
 
     map_out_dir = os.path.join(output_dir, map_name)
     if not dry_run:

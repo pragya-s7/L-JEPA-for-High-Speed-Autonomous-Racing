@@ -1,8 +1,7 @@
 # L-JEPA Configuration
 
 gym:
-  # Path to the f1tenth_gym repo (old gym API)
-  gym_path: /home/pragya/f1tenth_gym
+  gym_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/
   timestep: 0.01
   integrator: RK4  # or Euler
   num_beams: 1080
@@ -10,31 +9,31 @@ gym:
 
 maps:
   # Maps available in the old gym. 'levine' needs a png (not present).
-  - name: berlin
-    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/berlin
+  - map_name: berlin
+    map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/berlin
     map_ext: .png
     start_pose: [0.0, 0.0, 1.37]   # [x, y, theta]
-  - name: skirk
-    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/skirk
+  - map_name: skirk
+    map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/skirk
     map_ext: .png
     start_pose: [0.0, 0.0, 0.0]
-  - name: vegas
-    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/vegas
+  - map_name: vegas
+    map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/vegas
     map_ext: .png
     start_pose: [0.0, 0.0, 0.0]
-  - name: stata_basement
-    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/stata_basement
+  - map_name: stata_basement
+    map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/stata_basement
     map_ext: .png
     start_pose: [0.0, 0.0, 0.0]
 
 data_collection:
-  output_dir: /home/pragya/ljepa/data
+  output_dir: /home/jarvis615/roboracer_ws/src/f1tenth_gym/L-JEPA-for-High-Speed-Autonomous-Racing/data
   episodes_per_map: 20          # number of episodes per map
   max_steps_per_episode: 3000   # max steps before reset
   context_window: 4             # h: number of past scans fed to encoder
   prediction_horizon: 5         # k: steps ahead to predict
   min_episode_steps: 100        # discard very short episodes (collisions)
-  controller: follow_the_gap    # or pure_pursuit
+  controller: rrt    # or pure_pursuit
 
 model:
   # LiDAR input: 1080 beams (raw) or subsampled
@@ -62,12 +61,12 @@ pretrain:
   weight_decay: 1.0e-5
   ema_decay: 0.996              # target encoder EMA decay
   prediction_horizon: 5         # k
-  checkpoint_dir: /home/pragya/ljepa/checkpoints/pretrain
+  checkpoint_dir: /home/jarvis615/roboracer_ws/src/f1tenth_gym/L-JEPA-for-High-Speed-Autonomous-Racing/checkpoints/pretrain
   log_every: 10                 # log every N epochs
 
 rl:
-  checkpoint_dir: /home/pragya/ljepa/checkpoints/rl
-  encoder_checkpoint: /home/pragya/ljepa/checkpoints/pretrain/best.pt
+  checkpoint_dir: /home/jarvis615/roboracer_ws/src/f1tenth_gym/L-JEPA-for-High-Speed-Autonomous-Racing/checkpoints/rl
+  encoder_checkpoint: /home/jarvis615/roboracer_ws/src/f1tenth_gym/L-JEPA-for-High-Speed-Autonomous-Racing/checkpoints/pretrain/best.pt
   total_steps: 2_000_000
   rollout_steps: 2048           # steps per PPO update
   num_envs: 1
@@ -85,18 +84,33 @@ rl:
 
   reward:
     progress_weight: 1.0        # reward per meter of track progress
-    collision_penalty: -10.0
+    collision_penalty: -100.0
     velocity_bonus: 0.0         # optional: weight on forward velocity
 
   # Training map (single map for RL)
-  map_name: berlin
-  map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/berlin
-  map_ext: .png
-  start_pose: [0.0, 0.0, 1.37]
+  training_maps:
+    - name: berlin
+      map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/berlin
+      map_ext: .png
+      start_pose: [0.0, 0.0, 1.37]
+    - name: stata_basement
+      map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/stata_basement
+      map_ext: .png
+      start_pose: [0.0, 0.0, 0.0]
+    - name: vegas
+      map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/vegas
+      map_ext: .png
+      start_pose: [0.0, 0.0, 0.0]
+    - name: levine
+      map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/levine
+      map_ext: .pgm
+      start_pose: [0.0, 0.0, 0.0]
+
+
 
 evaluate:
   map_name: berlin
-  map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/berlin
+  map_path: /home/jarvis615/roboracer_ws/src/f1tenth_gym/gym/f110_gym/envs/maps/berlin
   map_ext: .png
   start_pose: [0.0, 0.0, 1.37]
   num_episodes: 10

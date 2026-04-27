@@ -87,7 +87,7 @@ class LiDARTrajectoryDataset(Dataset):
 
         for d in search_dirs:
             map_name = os.path.basename(d)
-            ep_files = sorted(glob.glob(os.path.join(d, 'ep_*.npz')))
+            ep_files = sorted(glob.glob(os.path.join(d, '*.npz')))
             ep_count = 0
             for path in ep_files:
                 data = np.load(path)

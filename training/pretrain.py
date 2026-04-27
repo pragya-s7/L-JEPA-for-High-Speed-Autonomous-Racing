@@ -61,7 +61,15 @@ def train(cfg_path):
     pc = cfg['pretrain']
     dc = cfg['data_collection']
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')  # explicitly NVIDIA, not Intel iGPU
+        torch.backends.cudnn.benchmark = True  # faster convolutions
+        torch.backends.cuda.matmul.allow_tf32 = True  # faster matmul on Ampere+
+        print(f"Device: {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        device = torch.device('cpu')
+        print("WARNING: CUDA not available, falling back to CPU")
     print(f"Device: {device}")
 
     # Data
@@ -100,9 +108,9 @@ def train(cfg_path):
         t0 = time.time()
 
         for batch_idx, (context_obs, future_obs, actions) in enumerate(loader):
-            context_obs = context_obs.to(device)
-            future_obs = future_obs.to(device)
-            actions = actions.to(device)
+            context_obs = context_obs.to(device, non_blocking=True)
+            future_obs   = future_obs.to(device, non_blocking=True)
+            actions      = actions.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             loss, z_ctx, z_pred = model(context_obs, future_obs, actions)
