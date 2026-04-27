@@ -193,6 +193,7 @@ def train(cfg_path, encoder_path_override=None):
         obs_dim=mc['obs_dim'],
         lidar_dim=mc['lidar_dim'],
         subsample_step=mc['lidar_subsample'],
+        range_max=10.0,  # must match RANGE_MAX in collect_data.py
     )
 
     checkpoint_dir = rl_cfg['checkpoint_dir']
