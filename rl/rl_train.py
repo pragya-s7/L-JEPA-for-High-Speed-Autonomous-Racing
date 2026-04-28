@@ -158,20 +158,156 @@ def make_env(map_path, map_ext, timestep):
     )
 
 
-def compute_reward(delta_arc, lateral, collision, reward_cfg):
-    """Centerline-based reward: forward arc progress minus lateral deviation."""
+class DomainRandomizer:
+    def __init__(self, config):
+        self.cfg = config.get('domain_randomization', {})
+        self.enabled = self.cfg.get('enabled', False)
+        self.action_delay_buffer = deque(maxlen=10)
+        self.current_delay = 0
+
+    def randomize(self, env):
+        if not self.enabled:
+            return
+        
+        # Access existing params to avoid wiping them out (gym is destructive)
+        # Correct path for f110_gym: env.unwrapped.sim.agents[0].params
+        try:
+            current_params = env.unwrapped.sim.agents[0].params.copy()
+        except AttributeError:
+            try:
+                current_params = env.unwrapped.agents[0].params.copy()
+            except AttributeError:
+                # Comprehensive fallback with all required SOTA constants
+                current_params = {
+                    'mu': 1.0489, 'C_Sf': 4.718, 'C_Sr': 5.4562, 'm': 3.74,
+                    'lf': 0.15875, 'lr': 0.17145, 'h': 0.074, 'I': 0.04712,
+                    's_min': -0.4189, 's_max': 0.4189, 'sv_min': -3.2, 'sv_max': 3.2,
+                    'v_switch': 7.319, 'a_max': 9.51, 'v_min': -5.0, 'v_max': 20.0,
+                    'width': 0.31, 'length': 0.58
+                }
+
+        # Nominal values (from f1tenth_rl_humble or standard params)
+        mu = np.random.uniform(*self.cfg.get('friction_range', [0.6, 1.2]))
+        m = np.random.uniform(*self.cfg.get('mass_range', [3.0, 4.5]))
+        stiff_scale = np.random.uniform(*self.cfg.get('stiffness_range', [0.8, 1.2]))
+        
+        # Update only specific keys
+        current_params['mu'] = mu
+        current_params['m'] = m
+        current_params['C_Sf'] = 4.718 * stiff_scale
+        current_params['C_Sr'] = 5.4562 * stiff_scale
+
+        # f110_gym (old) update_params takes a dict
+        # env.unwrapped is the F110Env which supports (params, agent_idx) positionally
+        env.unwrapped.update_params(current_params, 0)
+
+        # Action delay randomization
+        max_delay = self.cfg.get('max_action_delay', 3)
+        self.current_delay = np.random.randint(0, max_delay + 1)
+        self.action_delay_buffer.clear()
+
+    def apply_action_delay(self, action):
+        if not self.enabled or self.current_delay == 0:
+            return action
+        
+        self.action_delay_buffer.append(action)
+        if len(self.action_delay_buffer) > self.current_delay:
+            return self.action_delay_buffer[0]
+        else:
+            return np.array([0.0, 0.0], dtype=np.float32)
+
+    def apply_sensor_noise(self, scan):
+        if not self.enabled:
+            return scan
+        
+        # Gaussian noise
+        noise_std = self.cfg.get('lidar_noise_std', 0.02)
+        scan = scan + np.random.normal(0, noise_std, size=scan.shape)
+        
+        # Dropout
+        dropout_prob = self.cfg.get('lidar_dropout_prob', 0.01)
+        mask = np.random.random(size=scan.shape) < dropout_prob
+        scan[mask] = 0.0
+        
+        return scan
+
+
+class BacktrackBuffer:
+    def __init__(self, timestep, seconds=2.0, max_backtracks=3):
+        self.capacity = int(seconds / timestep)
+        self.buffer = deque(maxlen=self.capacity)
+        self.max_backtracks = max_backtracks
+        self.current_backtracks = 0
+
+    def add(self, pose):
+        # pose is [x, y, theta]
+        self.buffer.append(pose)
+
+    def get_backtrack_pose(self):
+        if not self.buffer:
+            return None
+        # Return the oldest pose in buffer (which is 'seconds' ago)
+        return self.buffer[0]
+
+    def reset_count(self):
+        self.current_backtracks = 0
+
+    def increment_count(self):
+        self.current_backtracks += 1
+        return self.current_backtracks
+
+
+def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, reward_cfg, tracker=None):
+    """State-of-the-art reward function for F1TENTH RL."""
     if collision:
         return reward_cfg['collision_penalty']
-    r = reward_cfg['progress_weight'] * delta_arc
-    r -= reward_cfg.get('deviation_weight', 0.05) * lateral
-    return r
+    
+    reward_type = reward_cfg.get('type', 'dense')
+    
+    if reward_type == 'sparse':
+        # Sparse reward: milestones based on total track length
+        if tracker is None or tracker.total_length == 0:
+            return 0.0
+        
+        # Checkpoint reward: every 10% of the track
+        prev_progress = (tracker._last_s - delta_arc) / tracker.total_length
+        curr_progress = tracker._last_s / tracker.total_length
+        
+        # If we crossed a 0.1 boundary
+        r = 0.0
+        if int(curr_progress * 10) > int(prev_progress * 10):
+            r += reward_cfg.get('checkpoint_reward', 1.0)
+            
+        # Lap bonus (if we wrapped around)
+        if delta_arc < -tracker.total_length / 2.0:
+            r += reward_cfg.get('lap_bonus', 50.0)
+            
+        return r
+    else:
+        # State-of-the-art Hybrid Dense Reward (inspired by f1tenth_rl_humble / Evans et al.)
+        # 1. Forward progress
+        r = reward_cfg.get('progress_weight', 5.0) * delta_arc
+        # 2. Cross-track penalty
+        r -= reward_cfg.get('deviation_weight', 0.05) * lateral
+        # 3. Speed bonus
+        r += reward_cfg.get('speed_weight', 0.1) * max(0.0, vel_x)
+        # 4. Steering smoothness penalty
+        if prev_steer is not None:
+            steer_delta = abs(steer - prev_steer)
+            r -= reward_cfg.get('steer_penalty', 0.0) * steer_delta
+            
+        return float(r)
 
 
-def compute_reward_fallback(vel_x, collision, reward_cfg):
+def compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg):
     """vel_x fallback for maps without a centerline."""
     if collision:
         return reward_cfg['collision_penalty']
-    return reward_cfg['progress_weight'] * max(float(vel_x), 0.0) * 0.01
+    
+    r = reward_cfg.get('progress_weight', 5.0) * max(float(vel_x), 0.0) * 0.01
+    if prev_steer is not None:
+        r -= reward_cfg.get('steer_penalty', 0.0) * abs(steer - prev_steer)
+    return float(r)
 
 
 def clamp_action(steer, speed):
@@ -278,6 +414,13 @@ def train(cfg_path, encoder_path_override=None):
     checkpoint_dir = rl_cfg['checkpoint_dir']
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    randomizer = DomainRandomizer(rl_cfg)
+    backtracker = BacktrackBuffer(
+        timestep=cfg['gym']['timestep'],
+        seconds=rl_cfg.get('backtrack', {}).get('seconds', 2.0),
+        max_backtracks=rl_cfg.get('backtrack', {}).get('max_backtracks', 3)
+    )
+
     rng = np.random.default_rng(seed=0)
 
     # Start on a random map
@@ -285,12 +428,15 @@ def train(cfg_path, encoder_path_override=None):
     env = current_map['env']
     start_pose = current_map['start_pose']
 
+    randomizer.randomize(env)
     obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
     obs_buf.reset()
-    obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
+    scan_noise = randomizer.apply_sensor_noise(obs['scans'][0])
+    obs_buf.update(scan_noise, float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
     tracker = current_map.get('tracker')
     if tracker is not None:
         tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
+    backtracker.reset_count()
 
     total_steps = 0
     update_count = 0
@@ -301,6 +447,7 @@ def train(cfg_path, encoder_path_override=None):
     best_mean_reward = float('-inf')
     ep_reward = 0.0
     ep_len = 0
+    prev_steer = 0.0
 
     print(f"\nStarting RL training for {rl_cfg['total_steps']:,} steps...")
 
@@ -312,18 +459,23 @@ def train(cfg_path, encoder_path_override=None):
 
             action_t, log_prob, value = ppo.act(z)
             steer, speed = clamp_action(float(action_t[0, 0].cpu()), float(action_t[0, 1].cpu()))
+            
+            # Apply action delay (DR)
+            delayed_action = randomizer.apply_action_delay(np.array([steer, speed], dtype=np.float32))
 
-            obs, _, done, _ = env.step(np.array([[steer, speed]]))
+            obs, _, done, _ = env.step(np.array([delayed_action]))
             collision = bool(obs['collisions'][0])
             vel_x = float(obs['linear_vels_x'][0])
+            pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
+            backtracker.add(pose)
 
             if tracker is not None:
-                delta_arc, lateral = tracker.step(
-                    float(obs['poses_x'][0]), float(obs['poses_y'][0])
-                )
-                reward = compute_reward(delta_arc, lateral, collision, reward_cfg)
+                delta_arc, lateral = tracker.step(pose[0], pose[1])
+                reward = compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, reward_cfg, tracker=tracker)
             else:
-                reward = compute_reward_fallback(vel_x, collision, reward_cfg)
+                reward = compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg)
+
+            prev_steer = steer
 
             ppo.store(z.squeeze(0), action_t.squeeze(0), log_prob.squeeze(0),
                       reward, done, value.squeeze(0))
@@ -333,24 +485,42 @@ def train(cfg_path, encoder_path_override=None):
             total_steps += 1
 
             if done or collision:
-                ep_rewards.append(ep_reward)
-                ep_lengths.append(ep_len)
-                episode_count += 1
-                map_counts[current_map['name']] += 1
-                ep_reward = 0.0
-                ep_len = 0
+                # If collision, try backtracking first
+                bt_enabled = rl_cfg.get('backtrack', {}).get('enabled', False)
+                bt_pose = backtracker.get_backtrack_pose()
+                if collision and bt_enabled and bt_pose and backtracker.increment_count() <= backtracker.max_backtracks:
+                    # Backtrack reset
+                    obs, _, done, _ = env.reset(np.array([bt_pose]))
+                    prev_steer = 0.0
+                    # Note: obs_buf is NOT reset during backtrack to maintain temporal context
+                    # but we should update it with the new pose's scan
+                    if tracker is not None:
+                        # Resync tracker to backtrack pose
+                        tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
+                else:
+                    # Full episode reset
+                    ep_rewards.append(ep_reward)
+                    ep_lengths.append(ep_len)
+                    episode_count += 1
+                    map_counts[current_map['name']] += 1
+                    ep_reward = 0.0
+                    ep_len = 0
+                    prev_steer = 0.0
 
-                # Switch to a random map each episode
-                current_map = map_pool[rng.integers(len(map_pool))]
-                env = current_map['env']
-                start_pose = current_map['start_pose']
-                obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
-                obs_buf.reset()
-                tracker = current_map.get('tracker')
-                if tracker is not None:
-                    tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
+                    # Switch to a random map each episode
+                    current_map = map_pool[rng.integers(len(map_pool))]
+                    env = current_map['env']
+                    start_pose = current_map['start_pose']
+                    randomizer.randomize(env)
+                    obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
+                    obs_buf.reset()
+                    tracker = current_map.get('tracker')
+                    if tracker is not None:
+                        tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
+                    backtracker.reset_count()
 
-            obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
+            scan_noise = randomizer.apply_sensor_noise(obs['scans'][0])
+            obs_buf.update(scan_noise, float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
 
         # GAE last value
         obs_seq = torch.from_numpy(obs_buf.get()).unsqueeze(0).to(device)

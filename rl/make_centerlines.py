@@ -28,13 +28,19 @@ MAP_START_POSES = {
     'stata_basement': [0.0, 0.0, 0.0],
     'vegas':          [0.0, 0.0, 0.0],
     'skirk':          [0.0, 0.0, 0.0],
+    'levine':         [0.0, 0.0, 0.0],
+}
+
+MAP_EXTENSIONS = {
+    'levine': '.pgm',
 }
 
 
 def load_map(name):
     """Return (binary_free_array, resolution_m_per_px, origin_xy)."""
     base = os.path.join(MAPS_DIR, name)
-    img = np.array(Image.open(base + '.png').convert('L'))
+    ext = MAP_EXTENSIONS.get(name, '.png')
+    img = np.array(Image.open(base + ext).convert('L'))
     with open(base + '.yaml') as f:
         meta = yaml.safe_load(f)
     return img > 127, float(meta['resolution']), meta['origin']
@@ -242,9 +248,10 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     for name in args.maps:
-        png = os.path.join(MAPS_DIR, name + '.png')
-        if not os.path.exists(png):
-            print(f'[SKIP] {name}: {png} not found')
+        ext = MAP_EXTENSIONS.get(name, '.png')
+        map_file = os.path.join(MAPS_DIR, name + ext)
+        if not os.path.exists(map_file):
+            print(f'[SKIP] {name}: {map_file} not found')
             continue
 
         print(f'\n{name}:')
