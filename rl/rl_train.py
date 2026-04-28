@@ -90,7 +90,12 @@ class ObsBuffer:
     def update(self, scan_raw, vel_x, ang_vel):
         scan_sub = scan_raw[::self.subsample_step].astype(np.float32)
         scan_sub = np.clip(scan_sub, 0.0, RANGE_MAX) / RANGE_MAX
-        obs = np.concatenate([scan_sub, [vel_x, ang_vel]], dtype=np.float32)
+        
+        # Explicitly cast scalars to float32 to avoid Python 3.12 overflow warnings during concat
+        v = np.float32(vel_x)
+        a = np.float32(ang_vel)
+        
+        obs = np.concatenate([scan_sub, [v, a]], dtype=np.float32)
         self.buffer[:-1] = self.buffer[1:]
         self.buffer[-1] = obs
 
