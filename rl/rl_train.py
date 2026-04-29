@@ -153,6 +153,8 @@ class CenterlineTracker:
 
 
 def make_env(map_path, map_ext, timestep):
+    # Disable the env checker to prevent AssertionError on newer gym versions (0.25+)
+    # while using the legacy f110_gym.
     return gym.make(
         'f110_gym:f110-v0',
         map=map_path,
@@ -160,6 +162,7 @@ def make_env(map_path, map_ext, timestep):
         num_agents=1,
         timestep=timestep,
         integrator=Integrator.RK4,
+        disable_env_checker=True
     )
 
 
@@ -434,7 +437,14 @@ def train(cfg_path, encoder_path_override=None):
     start_pose = current_map['start_pose']
 
     randomizer.randomize(env)
-    obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
+    # Satisfy newer gym's OrderEnforcing wrapper by manually setting its internal flag
+    if hasattr(env, '_has_reset'):
+        env._has_reset = True
+    elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'):
+        env.env._has_reset = True
+
+    # Use env.unwrapped.reset to actually set the pose in legacy f110_gym
+    obs, _, done, _ = env.unwrapped.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
     obs_buf.reset()
     scan_noise = randomizer.apply_sensor_noise(obs['scans'][0])
     obs_buf.update(scan_noise, float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
@@ -488,17 +498,38 @@ def train(cfg_path, encoder_path_override=None):
             ep_reward += reward
             ep_len += 1
             total_steps += 1
+            
+            # Heartbeat logging every 500 steps
+            if total_steps % 500 == 0:
+                prog = (tracker._last_s / tracker.total_length) * 100 if tracker else 0
+                print(f"  [Step {total_steps:8,}] Speed: {vel_x:4.2f} m/s | Progress: {prog:5.1f}% | Ep Reward: {ep_reward:7.2f}")
 
-            if done or collision:
+            # Force reset if episode exceeds max_steps or car is stuck
+            timeout = ep_len >= cfg['data_collection'].get('max_steps_per_episode', 3000)
+
+            if done or collision or timeout:
                 # If collision, try backtracking first
                 bt_enabled = rl_cfg.get('backtrack', {}).get('enabled', False)
                 bt_pose = backtracker.get_backtrack_pose()
-                if collision and bt_enabled and bt_pose and backtracker.increment_count() <= backtracker.max_backtracks:
+                if collision and bt_enabled and bt_pose and not timeout and backtracker.increment_count() <= backtracker.max_backtracks:
                     # Backtrack reset
-                    obs, _, done, _ = env.reset(np.array([bt_pose]))
+                    # Satisfy newer gym's OrderEnforcing wrapper by manually setting its internal flag
+                    if hasattr(env, '_has_reset'):
+                        env._has_reset = True
+                    elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'):
+                        env.env._has_reset = True
+                    
+                    # Use env.unwrapped.reset to actually set the pose in legacy f110_gym
+                    obs, _, done, _ = env.unwrapped.reset(np.array([bt_pose]))
                     prev_steer = 0.0
-                    # Note: obs_buf is NOT reset during backtrack to maintain temporal context
-                    # but we should update it with the new pose's scan
+                    
+                    # CRITICAL: Reset and resync obs_buf so the model doesn't see "crash frames"
+                    obs_buf.reset()
+                    scan_noise = randomizer.apply_sensor_noise(obs['scans'][0])
+                    # Fill buffer with the backtrack start frame to provide a stable initial context
+                    for _ in range(mc['context_window']):
+                        obs_buf.update(scan_noise, float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
+                    
                     if tracker is not None:
                         # Resync tracker to backtrack pose
                         tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
@@ -512,12 +543,21 @@ def train(cfg_path, encoder_path_override=None):
                     ep_len = 0
                     prev_steer = 0.0
 
-                    # Switch to a random map each episode
+                    # Full episode reset
                     current_map = map_pool[rng.integers(len(map_pool))]
                     env = current_map['env']
                     start_pose = current_map['start_pose']
                     randomizer.randomize(env)
-                    obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
+
+                # Satisfy newer gym's OrderEnforcing wrapper by manually setting its internal flag
+                if hasattr(env, '_has_reset'):
+                    env._has_reset = True
+                elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'):
+                    env.env._has_reset = True
+                
+                # Use env.unwrapped.reset to actually set the pose in legacy f110_gym
+                obs, _, done, _ = env.unwrapped.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
+
                     obs_buf.reset()
                     tracker = current_map.get('tracker')
                     if tracker is not None:
