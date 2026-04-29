@@ -141,13 +141,22 @@ class CenterlineTracker:
         if self._last_s is None:
             self._last_s = curr_s
             return 0.0, float(lateral)
+        
         delta_s = curr_s - self._last_s
+        
+        # Handle wrap-around for closed tracks
         if self.is_closed:
             half = self.total_length / 2.0
             if delta_s > half:
                 delta_s -= self.total_length
             elif delta_s < -half:
                 delta_s += self.total_length
+        
+        # CRITICAL: Cap delta_s to prevent massive reward spikes if tracker jumps
+        # or if an open track "snaps" back to the start.
+        # Max car speed is ~10m/s, so in 0.01s, max delta_s should be ~0.1m.
+        delta_s = np.clip(delta_s, -1.0, 1.0)
+        
         self._last_s = curr_s
         return delta_s, float(lateral)
 
@@ -329,7 +338,8 @@ def compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg):
 
 
 def clamp_action(steer, speed):
-    return float(np.clip(steer, -0.4189, 0.4189)), float(np.clip(speed, 0.5, 5.0))
+    # Reduced max speed slightly to 4.5m/s to prevent RK4 integrator explosions at high slip angles
+    return float(np.clip(steer, -0.4189, 0.4189)), float(np.clip(speed, 0.5, 4.5))
 
 
 def build_map_pool(cfg):
@@ -492,6 +502,15 @@ def train(cfg_path, encoder_path_override=None):
             collision = bool(obs['collisions'][0])
             vel_x = float(obs['linear_vels_x'][0])
             pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
+            
+            # CRITICAL: Detect physics integrator explosion (NaN/Inf)
+            if not np.all(np.isfinite(pose)):
+                print(f"  [WARNING] Physics exploded at step {total_steps:,}! Forcing full reset.")
+                collision = True
+                done = True
+                # Set a dummy finite pose to prevent tracker crash during this final step
+                pose = [0.0, 0.0, 0.0]
+            
             backtracker.add(pose)
 
             if tracker is not None:
@@ -553,20 +572,19 @@ def train(cfg_path, encoder_path_override=None):
                     ep_len = 0
                     prev_steer = 0.0
 
-                    # Full episode reset
                     current_map = map_pool[rng.integers(len(map_pool))]
                     env = current_map['env']
                     start_pose = current_map['start_pose']
                     randomizer.randomize(env)
 
-                # Satisfy newer gym's OrderEnforcing wrapper by manually setting its internal flag
-                if hasattr(env, '_has_reset'):
-                    env._has_reset = True
-                elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'):
-                    env.env._has_reset = True
-                
-                # Use env.unwrapped.reset to actually set the pose in legacy f110_gym
-                obs, _, done, _ = env.unwrapped.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
+                    # Satisfy newer gym's OrderEnforcing wrapper by manually setting its internal flag
+                    if hasattr(env, '_has_reset'):
+                        env._has_reset = True
+                    elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'):
+                        env.env._has_reset = True
+                    
+                    # Use env.unwrapped.reset to actually set the pose in legacy f110_gym
+                    obs, _, done, _ = env.unwrapped.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
 
                     obs_buf.reset()
                     tracker = current_map.get('tracker')
