@@ -293,16 +293,26 @@ def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, rewa
         return r
     else:
         # State-of-the-art Hybrid Dense Reward (inspired by f1tenth_rl_humble / Evans et al.)
-        # 1. Forward progress
-        r = reward_cfg.get('progress_weight', 5.0) * delta_arc
+        # 1. Forward progress with heavy penalty for reversing
+        if delta_arc >= 0:
+            r = reward_cfg.get('progress_weight', 10.0) * delta_arc
+        else:
+            # Heavy penalty for driving backwards to prevent "progress undoing"
+            r = reward_cfg.get('progress_weight', 10.0) * delta_arc * 5.0
+            
         # 2. Cross-track penalty
         r -= reward_cfg.get('deviation_weight', 0.05) * lateral
+        
         # 3. Speed bonus
         r += reward_cfg.get('speed_weight', 0.1) * max(0.0, vel_x)
+        
         # 4. Steering smoothness penalty
         if prev_steer is not None:
             steer_delta = abs(steer - prev_steer)
-            r -= reward_cfg.get('steer_penalty', 0.0) * steer_delta
+            r -= reward_cfg.get('steer_penalty', 0.2) * steer_delta
+            
+        # 5. Survival Reward: bonus for just staying alive to offset deviation penalties
+        r += reward_cfg.get('survival_reward', 0.05)
             
         return float(r)
 
