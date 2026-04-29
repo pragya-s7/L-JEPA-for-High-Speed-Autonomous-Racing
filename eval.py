@@ -88,7 +88,12 @@ class ObsBuffer:
     def update(self, scan_raw, vel_x, ang_vel):
         scan_sub = scan_raw[::self.subsample_step].astype(np.float32)
         scan_sub = np.clip(scan_sub, 0.0, RANGE_MAX) / RANGE_MAX
-        obs = np.concatenate([scan_sub, [vel_x, ang_vel]], dtype=np.float32)
+        
+        # Explicitly cast to float32 for Python 3.12
+        v = np.float32(vel_x)
+        a = np.float32(ang_vel)
+        
+        obs = np.concatenate([scan_sub, [v, a]], dtype=np.float32)
         self.buffer[:-1] = self.buffer[1:]
         self.buffer[-1] = obs
 
@@ -232,7 +237,10 @@ def main():
         subsample_step=mc['lidar_subsample'],
     )
 
-    gym_path = os.path.join(GYM_PATH, 'gym')
+    gym_path = cfg.get('gym', {}).get('gym_path', GYM_PATH)
+    if not os.path.isabs(gym_path):
+        gym_path = os.path.join(PROJECT_ROOT, gym_path)
+    gym_path = os.path.join(gym_path, 'gym')
 
     for map_name in args.maps:
         if map_name not in MAP_INFO:
