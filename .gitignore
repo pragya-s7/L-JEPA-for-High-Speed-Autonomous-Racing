@@ -1,3 +1,20 @@
 /data/
 /.claude/
-/__pychache__/
+/__pychache__/data/
+__pycache__/
+venv_collect/
+*.pyc
+/data/
+/checkpoints/
+/checkpoints (test)/
+/data/
+/checkpoints/
+/checkpoints (test)/
+__pycache__/
+venv_collect/
+/data/
+/checkpoints/
+/checkpoints (test)/
+__pycache__/
+venv_collect/
+/checkpoints.zip

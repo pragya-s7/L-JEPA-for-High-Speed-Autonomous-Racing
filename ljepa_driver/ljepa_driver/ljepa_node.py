@@ -49,6 +49,12 @@ class LJEPADriver(Node):
         self.declare_parameter('odom_topic',         '/ego_racecar/odom')
         self.declare_parameter('speed_sign',         -1.0)  # forward is negative on this car
         self.declare_parameter('steer_sign',          1.0)
+        self.declare_parameter('max_abs_steer',       0.10)
+        self.declare_parameter('steer_smoothing',      0.35)
+        self.declare_parameter('steer_bias',           0.0)
+        self.declare_parameter('safety_distance',      0.60)
+        self.declare_parameter('safety_speed',         0.80)
+        self.declare_parameter('inference_deterministic', True)
 
         ljepa_root  = self.get_parameter('ljepa_root').value
         enc_path    = self.get_parameter('encoder_checkpoint').value
@@ -56,6 +62,12 @@ class LJEPADriver(Node):
         odom_topic  = self.get_parameter('odom_topic').value
         self.speed_sign = float(self.get_parameter('speed_sign').value)
         self.steer_sign = float(self.get_parameter('steer_sign').value)
+        self.max_abs_steer = float(self.get_parameter('max_abs_steer').value)
+        self.steer_smoothing = float(self.get_parameter('steer_smoothing').value)
+        self.steer_bias = float(self.get_parameter('steer_bias').value)
+        self.safety_distance = float(self.get_parameter('safety_distance').value)
+        self.safety_speed = float(self.get_parameter('safety_speed').value)
+        self.inference_deterministic = bool(self.get_parameter('inference_deterministic').value)
 
         # Default checkpoint paths relative to ljepa_root
         if not enc_path:
@@ -71,8 +83,10 @@ class LJEPADriver(Node):
         import yaml
         from models import ContextEncoder
         from rl.ppo import ActorCritic
+        from controllers import FollowTheGap
 
         self._torch = torch
+        self.safety_controller = FollowTheGap()
         cfg_path = os.path.join(ljepa_root, 'config.yaml')
         with open(cfg_path) as f:
             cfg = yaml.safe_load(f)
@@ -124,6 +138,7 @@ class LJEPADriver(Node):
         # ── Observation buffer ───────────────────────────────────────────────
         self.obs_buffer  = np.zeros((self.context_window, self.obs_dim), dtype=np.float32)
         self.scans_seen  = 0   # counts up to context_window before we start driving
+        self.prev_steer = 0.0
 
         # ── Odometry state ───────────────────────────────────────────────────
         self.vel_x   = 0.0
@@ -189,10 +204,29 @@ class LJEPADriver(Node):
         obs_seq = torch.from_numpy(self.obs_buffer).unsqueeze(0).to(self.device)
         with torch.no_grad():
             z      = self.encoder(obs_seq)
-            action, _, _ = self.ac.get_action(z, deterministic=True)
+            action, _, _ = self.ac.get_action(z, deterministic=self.inference_deterministic)
 
-        steer = float(np.clip(action[0, 0].cpu().numpy(), -0.4189, 0.4189))
+        raw_steer = float(np.clip(action[0, 0].cpu().numpy(), -0.4189, 0.4189))
+        steer = (1.0 - self.steer_smoothing) * self.prev_steer + self.steer_smoothing * raw_steer
+        steer = float(np.clip(steer, -self.max_abs_steer, self.max_abs_steer))
+        self.prev_steer = steer
         speed = float(np.clip(action[0, 1].cpu().numpy(),  0.5,    5.0))
+
+        front_window = resampled[TRAIN_NUM_BEAMS // 2 - 40: TRAIN_NUM_BEAMS // 2 + 40]
+        min_front_dist = float(np.min(front_window)) if front_window.size else float(np.min(resampled))
+        if min_front_dist < self.safety_distance:
+            safe_steer, safe_speed = self.safety_controller.plan(
+                resampled.astype(np.float32),
+                angle_min=-TRAIN_FOV / 2.0,
+                angle_increment=TRAIN_FOV / (TRAIN_NUM_BEAMS - 1),
+                current_speed=float(self.vel_x),
+                dt=0.01,
+            )
+            steer = float(np.clip(safe_steer, -self.max_abs_steer, self.max_abs_steer))
+            speed = min(float(np.clip(safe_speed, 0.5, 5.0)), self.safety_speed)
+            self.prev_steer = steer
+
+        steer = float(np.clip(steer + self.steer_bias, -self.max_abs_steer, self.max_abs_steer))
 
         # ── Publish ──────────────────────────────────────────────────────────
         drive_msg = AckermannDriveStamped()

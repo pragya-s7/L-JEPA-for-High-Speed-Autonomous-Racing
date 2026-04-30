@@ -2,9 +2,11 @@
 """
 Data collection for L-JEPA pretraining.
 
-Runs Follow-the-Gap in f1tenth_gym and saves trajectory data.
+Runs a reactive controller (Follow-the-Gap or Wall-Follow) in f1tenth_gym
+and saves trajectory data.
 
-Each episode is saved as its own .npz file under data/{map_name}/ep_NNNN.npz.
+Each episode is saved as its own .npz file under
+    data/{map_name}__{controller}/ep_NNNN.npz
 Keeping episodes separate is critical: the L-JEPA dataset must never create a
 training sample whose context window spans an episode boundary (post-reset
 observations are from a different track position and are unrelated).
@@ -15,6 +17,11 @@ Saved arrays per episode:
     actions: (T, 2)                     float32  — [steer, speed] sent to gym
     poses:   (T, 3)                     float32  — [x, y, theta] for diagnostics
 
+Controller selection:
+    --controller CLI flag (highest priority)
+    data_collection.controller in config.yaml
+    default: follow_the_gap
+
 Gym path resolution (in order):
     1. --gym-path CLI argument
     2. F1TENTH_GYM_PATH environment variable
@@ -23,6 +30,7 @@ Gym path resolution (in order):
 
 Usage:
     python3 collect_data.py
+    python3 collect_data.py --controller wall_follow
     python3 collect_data.py --maps berlin vegas --episodes 30
     python3 collect_data.py --gym-path /path/to/f1tenth_gym/gym
     python3 collect_data.py --dry-run          # validate without saving
@@ -91,6 +99,28 @@ def find_maps_dir(gym_path):
 
 
 # ---------------------------------------------------------------------------
+# Controller factory
+# ---------------------------------------------------------------------------
+def make_controller(name):
+    """
+    Build a controller instance. The returned object must expose
+        plan(scan, angle_min=..., angle_increment=..., current_speed=..., dt=...)
+        reset()
+    """
+    name = name.lower().strip()
+    if name in ('follow_the_gap', 'ftg', 'gap'):
+        from controllers import FollowTheGap
+        return FollowTheGap(), 'follow_the_gap'
+    if name in ('wall_follow', 'wall', 'wf'):
+        from controllers import WallFollow
+        return WallFollow(), 'wall_follow'
+    raise ValueError(
+        f"Unknown controller '{name}'. "
+        f"Options: follow_the_gap, wall_follow"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Map catalogue
 # Maps that have a .png file and a confirmed working start pose.
 # start_pose: [x, y, theta_rad]
@@ -100,6 +130,7 @@ MAP_CATALOGUE = {
     'skirk':          {'ext': '.png', 'start_pose': [0.0, 0.0, 0.0]},
     'vegas':          {'ext': '.png', 'start_pose': [0.0, 0.0, 0.0]},
     'stata_basement': {'ext': '.png', 'start_pose': [0.0, 0.0, 0.0]},
+    'levine':         {'ext': '.pgm', 'start_pose': [0.0, 0.0, 0.0]},
 }
 
 # LiDAR constants (f1tenth_gym defaults, do not change unless you modified the gym)
@@ -195,7 +226,8 @@ def collect_episode(env, controller, start_pose, max_steps, subsample_step,
 # Map collection
 # ---------------------------------------------------------------------------
 def collect_map(map_name, map_info, gym_path, num_episodes, output_dir,
-                max_steps, min_steps, subsample_step, dry_run=False):
+                max_steps, min_steps, subsample_step, controller_name,
+                dry_run=False):
     """Collect episodes for one map and save to disk."""
     import gym as openai_gym
     from f110_gym.envs.base_classes import Integrator
@@ -211,7 +243,8 @@ def collect_map(map_name, map_info, gym_path, num_episodes, output_dir,
         return 0, 0
 
     print(f"\n{'='*60}")
-    print(f"Map: {map_name}  |  Episodes: {num_episodes}  |  Start: {start_pose}")
+    print(f"Map: {map_name}  |  Controller: {controller_name}")
+    print(f"Episodes: {num_episodes}  |  Start: {start_pose}")
     print(f"{'='*60}")
 
     env = openai_gym.make(
@@ -222,10 +255,11 @@ def collect_map(map_name, map_info, gym_path, num_episodes, output_dir,
         timestep=0.01,
         integrator=Integrator.RK4,
     )
-    from controllers import FollowTheGap
-    controller = FollowTheGap()
+    controller, resolved_name = make_controller(controller_name)
 
-    map_out_dir = os.path.join(output_dir, map_name)
+    # Keep each controller's data separated so ep_NNNN.npz indices
+    # from different controllers don't collide.
+    map_out_dir = os.path.join(output_dir, f'{map_name}__{resolved_name}')
     if not dry_run:
         os.makedirs(map_out_dir, exist_ok=True)
 
@@ -309,14 +343,14 @@ def print_dataset_stats(output_dir):
         eps = sorted(glob.glob(os.path.join(map_dir, 'ep_*.npz')))
         if not eps:
             continue
-        map_name = os.path.basename(map_dir)
+        label = os.path.basename(map_dir)
         total_steps = 0
         for ep_path in eps:
             d = np.load(ep_path)
             total_steps += len(d['scans'])
         grand_total += total_steps
-        print(f"  {map_name:20s}: {len(eps):4d} episodes, {total_steps:7,} steps")
-    print(f"  {'TOTAL':20s}: {grand_total:7,} steps")
+        print(f"  {label:32s}: {len(eps):4d} episodes, {total_steps:7,} steps")
+    print(f"  {'TOTAL':32s}: {grand_total:7,} steps")
 
 
 # ---------------------------------------------------------------------------
@@ -336,11 +370,14 @@ def main():
                              'Overrides auto-detection and F1TENTH_GYM_PATH env var.')
     parser.add_argument('--maps', nargs='+', default=None,
                         help='Maps to collect (default: all). '
-                             'Options: berlin skirk vegas stata_basement')
+                             'Options: berlin skirk vegas stata_basement levine')
     parser.add_argument('--episodes', type=int, default=None,
                         help='Episodes per map (overrides config)')
     parser.add_argument('--output-dir', default=None,
                         help='Where to save data (overrides config)')
+    parser.add_argument('--controller', default=None,
+                        help='Controller: follow_the_gap | wall_follow '
+                             '(overrides config)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Run without saving — useful for verifying setup')
     parser.add_argument('--stats', action='store_true',
@@ -355,6 +392,7 @@ def main():
     max_steps = dc['max_steps_per_episode']
     min_steps = dc['min_episode_steps']
     subsample_step = cfg['model']['lidar_subsample']
+    controller_name = args.controller or dc.get('controller', 'follow_the_gap')
 
     if args.stats:
         print_dataset_stats(output_dir)
@@ -363,6 +401,7 @@ def main():
     # Gym path
     gym_path = find_gym_path(args.gym_path)
     print(f"Using gym at: {gym_path}")
+    print(f"Controller: {controller_name}")
 
     # Add gym to path
     if gym_path not in sys.path:
@@ -380,6 +419,13 @@ def main():
 
     # Try headless setup (safe no-op if not needed)
     _setup_headless()
+
+    # Validate controller early so we fail fast before launching the env
+    try:
+        make_controller(controller_name)
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        return
 
     # Determine maps
     if args.maps:
@@ -411,6 +457,7 @@ def main():
             max_steps=max_steps,
             min_steps=min_steps,
             subsample_step=subsample_step,
+            controller_name=controller_name,
             dry_run=args.dry_run,
         )
         grand_eps += ep_count

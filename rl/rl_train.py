@@ -24,8 +24,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-GYM_PATH = '/home/pragya/f1tenth_gym'
-if GYM_PATH not in sys.path:
+DEFAULT_GYM_ROOT = '/home/ubuntu/f1tenth_gym'
+GYM_ROOT = os.environ.get('F1TENTH_GYM_ROOT', DEFAULT_GYM_ROOT)
+GYM_PATH = GYM_ROOT
+if os.path.join(GYM_PATH, 'gym') not in sys.path:
     sys.path.insert(0, os.path.join(GYM_PATH, 'gym'))
 
 import gym
