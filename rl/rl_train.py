@@ -135,14 +135,15 @@ class CenterlineTracker:
         self._last_s = float(self.s[idx])
 
     def step(self, x, y):
-        """Returns (delta_arc_m, lateral_m)."""
+        """Returns (delta_arc_m, lateral_m, lap_complete)."""
         lateral, idx = self._tree.query([x, y])
         curr_s = float(self.s[idx])
         if self._last_s is None:
             self._last_s = curr_s
-            return 0.0, float(lateral)
+            return 0.0, float(lateral), False
         
         delta_s = curr_s - self._last_s
+        lap_complete = False
         
         # Handle wrap-around for closed tracks
         if self.is_closed:
@@ -151,14 +152,13 @@ class CenterlineTracker:
                 delta_s -= self.total_length
             elif delta_s < -half:
                 delta_s += self.total_length
+                lap_complete = True # Detected wrap-around
         
-        # CRITICAL: Cap delta_s to prevent massive reward spikes if tracker jumps
-        # or if an open track "snaps" back to the start.
-        # Max car speed is ~10m/s, so in 0.01s, max delta_s should be ~0.1m.
+        # CRITICAL: Cap delta_s to prevent massive reward spikes
         delta_s = np.clip(delta_s, -1.0, 1.0)
         
         self._last_s = curr_s
-        return delta_s, float(lateral)
+        return delta_s, float(lateral), lap_complete
 
 
 def make_env(map_path, map_ext, timestep):
@@ -274,7 +274,7 @@ class BacktrackBuffer:
         return self.current_backtracks
 
 
-def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, reward_cfg, tracker=None):
+def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_complete, reward_cfg, tracker=None):
     """State-of-the-art reward function for F1TENTH RL."""
     if collision:
         return reward_cfg['collision_penalty']
@@ -296,32 +296,28 @@ def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, rewa
             r += reward_cfg.get('checkpoint_reward', 1.0)
             
         # Lap bonus (if we wrapped around)
-        if delta_arc < -tracker.total_length / 2.0:
-            r += reward_cfg.get('lap_bonus', 50.0)
+        if lap_complete:
+            r += reward_cfg.get('lap_bonus', 1000.0)
             
-        return r
+        return float(r)
     else:
-        # State-of-the-art Hybrid Dense Reward (inspired by f1tenth_rl_humble / Evans et al.)
-        # 1. Forward progress with heavy penalty for reversing
+        # State-of-the-art Hybrid Dense Reward
         if delta_arc >= 0:
             r = reward_cfg.get('progress_weight', 10.0) * delta_arc
         else:
-            # Heavy penalty for driving backwards to prevent "progress undoing"
             r = reward_cfg.get('progress_weight', 10.0) * delta_arc * 5.0
             
-        # 2. Cross-track penalty
-        r -= reward_cfg.get('deviation_weight', 0.05) * lateral
-        
-        # 3. Speed bonus
+        r -= reward_cfg.get('deviation_weight', 0.1) * lateral
         r += reward_cfg.get('speed_weight', 0.1) * max(0.0, vel_x)
         
-        # 4. Steering smoothness penalty
         if prev_steer is not None:
-            steer_delta = abs(steer - prev_steer)
-            r -= reward_cfg.get('steer_penalty', 0.2) * steer_delta
+            r -= reward_cfg.get('steer_penalty', 0.2) * abs(steer - prev_steer)
             
-        # 5. Survival Reward: bonus for just staying alive to offset deviation penalties
-        r += reward_cfg.get('survival_reward', 0.05)
+        r += reward_cfg.get('survival_reward', 0.1)
+
+        # Apply big lap bonus if we wrapped around
+        if lap_complete:
+            r += reward_cfg.get('lap_bonus', 1000.0)
             
         return float(r)
 
@@ -514,8 +510,8 @@ def train(cfg_path, encoder_path_override=None):
             backtracker.add(pose)
 
             if tracker is not None:
-                delta_arc, lateral = tracker.step(pose[0], pose[1])
-                reward = compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, reward_cfg, tracker=tracker)
+                delta_arc, lateral, lap_complete = tracker.step(pose[0], pose[1])
+                reward = compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_complete, reward_cfg, tracker=tracker)
             else:
                 reward = compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg)
 
@@ -540,27 +536,22 @@ def train(cfg_path, encoder_path_override=None):
                 # If collision, try backtracking first
                 bt_enabled = rl_cfg.get('backtrack', {}).get('enabled', False)
                 bt_pose = backtracker.get_backtrack_pose()
+                
                 if collision and bt_enabled and bt_pose and not timeout and backtracker.increment_count() <= backtracker.max_backtracks:
                     # Backtrack reset
-                    # Satisfy newer gym's OrderEnforcing wrapper by manually setting its internal flag
-                    if hasattr(env, '_has_reset'):
-                        env._has_reset = True
-                    elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'):
-                        env.env._has_reset = True
+                    if hasattr(env, '_has_reset'): env._has_reset = True
+                    elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'): env.env._has_reset = True
                     
-                    # Use env.unwrapped.reset to actually set the pose in legacy f110_gym
                     obs, _, done, _ = env.unwrapped.reset(np.array([bt_pose]))
                     prev_steer = 0.0
                     
-                    # CRITICAL: Reset and resync obs_buf so the model doesn't see "crash frames"
+                    # Resync temporal buffer
                     obs_buf.reset()
                     scan_noise = randomizer.apply_sensor_noise(obs['scans'][0])
-                    # Fill buffer with the backtrack start frame to provide a stable initial context
                     for _ in range(mc['context_window']):
                         obs_buf.update(scan_noise, float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
                     
                     if tracker is not None:
-                        # Resync tracker to backtrack pose
                         tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
                 else:
                     # Full episode reset
@@ -568,28 +559,24 @@ def train(cfg_path, encoder_path_override=None):
                     ep_lengths.append(ep_len)
                     episode_count += 1
                     map_counts[current_map['name']] += 1
-                    ep_reward = 0.0
-                    ep_len = 0
-                    prev_steer = 0.0
-
+                    
                     current_map = map_pool[rng.integers(len(map_pool))]
                     env = current_map['env']
                     start_pose = current_map['start_pose']
                     randomizer.randomize(env)
 
-                    # Satisfy newer gym's OrderEnforcing wrapper by manually setting its internal flag
-                    if hasattr(env, '_has_reset'):
-                        env._has_reset = True
-                    elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'):
-                        env.env._has_reset = True
+                    if hasattr(env, '_has_reset'): env._has_reset = True
+                    elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'): env.env._has_reset = True
                     
-                    # Use env.unwrapped.reset to actually set the pose in legacy f110_gym
                     obs, _, done, _ = env.unwrapped.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
-
                     obs_buf.reset()
                     tracker = current_map.get('tracker')
                     if tracker is not None:
                         tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
+                    
+                    ep_reward = 0.0
+                    ep_len = 0
+                    prev_steer = 0.0
                     backtracker.reset_count()
 
             scan_noise = randomizer.apply_sensor_noise(obs['scans'][0])

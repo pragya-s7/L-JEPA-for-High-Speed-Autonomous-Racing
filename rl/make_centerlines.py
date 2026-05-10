@@ -35,15 +35,30 @@ MAP_EXTENSIONS = {
     'levine': '.pgm',
 }
 
+def discover_maps():
+    maps = []
+    for f in os.listdir(MAPS_DIR):
+        if f.endswith('.yaml'):
+            name = f[:-5]
+            maps.append(name)
+    return sorted(maps)
 
 def load_map(name):
-    """Return (binary_free_array, resolution_m_per_px, origin_xy)."""
+    """Return (binary_free_array, resolution_m_per_px, origin_xy, map_ext)."""
     base = os.path.join(MAPS_DIR, name)
-    ext = MAP_EXTENSIONS.get(name, '.png')
+    ext = MAP_EXTENSIONS.get(name)
+    if not ext:
+        if os.path.exists(base + '.png'):
+            ext = '.png'
+        elif os.path.exists(base + '.pgm'):
+            ext = '.pgm'
+        else:
+            raise FileNotFoundError(f"No image file found for map {name}")
+    
     img = np.array(Image.open(base + ext).convert('L'))
     with open(base + '.yaml') as f:
         meta = yaml.safe_load(f)
-    return img > 127, float(meta['resolution']), meta['origin']
+    return img > 127, float(meta['resolution']), meta['origin'], ext
 
 
 def world_to_pixel(wx, wy, height, res, origin):
@@ -189,7 +204,7 @@ def extract_centerline_from_data(name, data_dir, downsample=10, return_thresh=2.
 
 
 def extract_centerline(name, erosion_px=3, downsample=5):
-    free, res, origin = load_map(name)
+    free, res, origin, ext = load_map(name)
     h = free.shape[0]
 
     struct = np.ones((2 * erosion_px + 1, 2 * erosion_px + 1), dtype=bool)
@@ -210,11 +225,17 @@ def extract_centerline(name, erosion_px=3, downsample=5):
     if n_skel < 10:
         raise RuntimeError("Skeleton is empty after pruning. Try reducing --erosion.")
 
-    sx, sy, stheta = MAP_START_POSES.get(name, [0.0, 0.0, 0.0])
-    seed_col, seed_row = world_to_pixel(sx, sy, h, res, origin)
-    # Direction in (col, row) image space: col ~ world-x, row ~ -world-y
-    init_dcol = np.cos(stheta)
-    init_drow = -np.sin(stheta)
+    if name in MAP_START_POSES:
+        sx, sy, stheta = MAP_START_POSES[name]
+        seed_col, seed_row = world_to_pixel(sx, sy, h, res, origin)
+        # Direction in (col, row) image space: col ~ world-x, row ~ -world-y
+        init_dcol = np.cos(stheta)
+        init_drow = -np.sin(stheta)
+    else:
+        # Pick any pixel from the skeleton as a seed
+        rows_px, cols_px = np.where(skel)
+        seed_row, seed_col = rows_px[0], cols_px[0]
+        init_dcol, init_drow = 1.0, 0.0
 
     rows_px, cols_px = order_skeleton(skel, seed_col, seed_row, init_dcol, init_drow)
 
@@ -232,7 +253,7 @@ def extract_centerline(name, erosion_px=3, downsample=5):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--maps', nargs='+', default=list(MAP_START_POSES.keys()))
+    parser.add_argument('--maps', nargs='+', default=discover_maps())
     parser.add_argument('--out', default=DEFAULT_OUT)
     parser.add_argument('--data-dir', default=os.path.join(PROJECT_ROOT, 'data'),
                         help='Phase 1 data directory. If a map subfolder exists here, '
@@ -248,10 +269,10 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     for name in args.maps:
-        ext = MAP_EXTENSIONS.get(name, '.png')
-        map_file = os.path.join(MAPS_DIR, name + ext)
-        if not os.path.exists(map_file):
-            print(f'[SKIP] {name}: {map_file} not found')
+        try:
+            free, res, origin, ext = load_map(name)
+        except Exception as e:
+            print(f'[SKIP] {name}: {e}')
             continue
 
         print(f'\n{name}:')
@@ -268,7 +289,7 @@ def main():
             print(f'  [skeleton mode]', end=' ')
             x, y, s = extract_centerline(name, args.erosion, args.downsample_skel)
             loop_gap = np.hypot(x[-1] - x[0], y[-1] - y[0])
-            if loop_gap > 5.0 and use_data:
+            if loop_gap > 10.0 and use_data:
                 print(f'\n  skeleton loop_gap={loop_gap:.1f}m — falling back to trajectory data')
                 x, y, s = extract_centerline_from_data(name, args.data_dir, args.downsample_data)
         except Exception as e:
@@ -291,6 +312,11 @@ def main():
         print(f'  waypoints={len(x)}  track_length={s[-1]:.1f}m  '
               f'loop_gap={loop_gap:.2f}m  ({time.time()-t0:.1f}s)')
         print(f'  -> {out_path}')
+
+
+if __name__ == '__main__':
+    main()
+
 
 
 if __name__ == '__main__':

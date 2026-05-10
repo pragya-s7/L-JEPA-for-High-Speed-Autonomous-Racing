@@ -102,7 +102,8 @@ class ObsBuffer:
 
 
 def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device, render=False):
-    obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
+    # Use env.unwrapped.reset to bypass newer gym's strict API checks
+    obs, _, done, _ = env.unwrapped.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
     obs_buf.reset()
     obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
     if render:
@@ -176,6 +177,7 @@ def eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg, num_episodes, max_st
         num_agents=1,
         timestep=0.01,
         integrator=Integrator.RK4,
+        disable_env_checker=True
     )
     start_pose = MAP_INFO[map_name]['start_pose']
     results = []

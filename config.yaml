@@ -32,7 +32,7 @@ data_collection:
   episodes_per_map: 20          # number of episodes per map
   max_steps_per_episode: 3000   # max steps before reset
   context_window: 4             # h: number of past scans fed to encoder
-  prediction_horizon: 5         # k: steps ahead to predict
+  prediction_horizon: 30         # k: steps ahead to predict
   min_episode_steps: 100        # discard very short episodes (collisions)
   controller: follow_the_gap    # or pure_pursuit
 
@@ -45,7 +45,7 @@ model:
   context_window: 4             # h
   action_dim: 2                 # [steer, speed]
   latent_dim: 64                # d: encoder output dimension
-  prediction_horizon: 5         # k: steps ahead to predict (must match data_collection)
+  prediction_horizon: 30         # k: steps ahead to predict (must match data_collection)
 
   encoder:
     channels: [32, 64, 128]     # conv1d channel progression
@@ -61,7 +61,7 @@ pretrain:
   lr: 3.0e-4
   weight_decay: 1.0e-5
   ema_decay: 0.996              # target encoder EMA decay
-  prediction_horizon: 5         # k
+  prediction_horizon: 30         # k
   checkpoint_dir: /home/pragya/ljepa/checkpoints/pretrain
   log_every: 10                 # log every N epochs
 
@@ -77,7 +77,7 @@ rl:
   clip_eps: 0.2
   epochs_per_update: 10
   minibatch_size: 64
-  entropy_coef: 0.02            # increased to 0.02 to prevent stalling
+  entropy_coef: 0.01            # decreased to lock in racing line
   value_coef: 0.5
   max_grad_norm: 0.5
   log_every: 5
@@ -94,7 +94,7 @@ rl:
     survival_reward: 0.1        # bonus per step to keep car driving
     collision_penalty: -500.0   # heavy penalty to ensure crashing is the absolute worst case
     checkpoint_reward: 1.0      # used in sparse mode
-    lap_bonus: 50.0             # used in sparse mode
+    lap_bonus: 1000.0           # massive bonus for lap completion
 
 
   domain_randomization:
