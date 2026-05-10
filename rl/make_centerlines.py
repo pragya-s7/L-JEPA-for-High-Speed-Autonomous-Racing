@@ -58,7 +58,8 @@ def load_map(name):
     img = np.array(Image.open(base + ext).convert('L'))
     with open(base + '.yaml') as f:
         meta = yaml.safe_load(f)
-    return img > 127, float(meta['resolution']), meta['origin'], ext
+    # Strictly white (255) is usually the track. Gray (205) is background/unknown.
+    return img > 250, float(meta['resolution']), meta['origin'], ext
 
 
 def world_to_pixel(wx, wy, height, res, origin):
@@ -244,11 +245,21 @@ def extract_centerline(name, erosion_px=3, downsample=5):
 
     x, y = pixel_to_world(rows_px, cols_px, h, res, origin)
 
-    dx = np.diff(x)
-    dy = np.diff(y)
-    s = np.concatenate([[0.0], np.cumsum(np.sqrt(dx**2 + dy**2))])
+    dx = np.gradient(x)
+    dy = np.gradient(y)
+    s = np.concatenate([[0.0], np.cumsum(np.sqrt(np.diff(x)**2 + np.diff(y)**2))])
+    # Re-interpolate s to match x, y length if needed, but gradient is easier
+    ds = np.sqrt(dx**2 + dy**2)
+    s = np.cumsum(ds)
+    s -= s[0]
 
-    return x, y, s
+    psi = np.arctan2(dy, dx)
+    
+    # Dummy curvature and speed
+    kappa = np.zeros_like(s)
+    v = np.ones_like(s) * 2.0 # Default 2m/s
+
+    return s, x, y, psi, kappa, v
 
 
 def main():
@@ -284,19 +295,23 @@ def main():
         )
 
         try:
-            # Always try skeleton first.  If it produces a clean closed loop
-            # (gap < 5 m), keep it.  Otherwise fall back to trajectory data.
+            # Always try skeleton first.
             print(f'  [skeleton mode]', end=' ')
-            x, y, s = extract_centerline(name, args.erosion, args.downsample_skel)
+            s, x, y, psi, kappa, v = extract_centerline(name, args.erosion, args.downsample_skel)
             loop_gap = np.hypot(x[-1] - x[0], y[-1] - y[0])
             if loop_gap > 10.0 and use_data:
                 print(f'\n  skeleton loop_gap={loop_gap:.1f}m — falling back to trajectory data')
-                x, y, s = extract_centerline_from_data(name, args.data_dir, args.downsample_data)
+                # For now fallback still uses old 3-col logic, but let's fix it too
+                x, y, _s = extract_centerline_from_data(name, args.data_dir, args.downsample_data)
+                dx, dy = np.gradient(x), np.gradient(y)
+                s, psi, kappa, v = _s, np.arctan2(dy, dx), np.zeros_like(_s), np.ones_like(_s)*2.0
         except Exception as e:
             if use_data:
                 print(f'\n  skeleton failed ({e}), trying trajectory data...')
                 try:
                     x, y, s = extract_centerline_from_data(name, args.data_dir, args.downsample_data)
+                    dx, dy = np.gradient(x), np.gradient(y)
+                    psi, kappa, v = np.arctan2(dy, dx), np.zeros_like(s), np.ones_like(s)*2.0
                 except Exception as e2:
                     print(f'  ERROR: {e2}')
                     continue
@@ -305,8 +320,8 @@ def main():
                 continue
 
         out_path = os.path.join(args.out, f'{name}_centerline.csv')
-        np.savetxt(out_path, np.column_stack([s, x, y]),
-                   delimiter=';', header='s_m;x_m;y_m', comments='', fmt='%.6f')
+        np.savetxt(out_path, np.column_stack([s, x, y, psi, kappa, v]),
+                   delimiter=';', header='s_m;x_m;y_m;psi_rad;kappa_m;v_mps', comments='', fmt='%.6f')
 
         loop_gap = np.hypot(x[-1] - x[0], y[-1] - y[0])
         print(f'  waypoints={len(x)}  track_length={s[-1]:.1f}m  '
