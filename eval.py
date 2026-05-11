@@ -14,12 +14,25 @@ import argparse
 import time
 
 import numpy as np
-import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-GYM_PATH = '/home/pragya/f1tenth_gym'
-sys.path.insert(0, os.path.join(GYM_PATH, 'gym'))
 sys.path.insert(0, PROJECT_ROOT)
+
+import yaml
+
+_DEFAULT_CFG = os.path.join(PROJECT_ROOT, 'config.yaml')
+if os.path.isfile(_DEFAULT_CFG):
+    with open(_DEFAULT_CFG) as _f:
+        _cfg0 = yaml.safe_load(_f)
+    _gym_root = _cfg0.get('gym', {}).get('gym_path', '')
+else:
+    _gym_root = ''
+if not _gym_root:
+    _gym_root = os.environ.get('F1TENTH_GYM', '')
+if _gym_root and not os.path.isabs(_gym_root):
+    _gym_root = os.path.join(PROJECT_ROOT, _gym_root)
+GYM_PATH = _gym_root or '/home/yim/f1tenth_gym'
+sys.path.insert(0, os.path.join(GYM_PATH, 'gym'))
 
 import torch
 
@@ -35,7 +48,7 @@ def load_config(path):
 
 def load_models(cfg, encoder_path, policy_path, device):
     from models import ContextEncoder
-    from rl.ppo import ActorCritic
+    from rl.ppo import ActorCritic, raw_to_env_action  # noqa: F401 (re-exported for callers)
 
     mc = cfg['model']
     encoder = ContextEncoder(
@@ -88,7 +101,12 @@ class ObsBuffer:
     def update(self, scan_raw, vel_x, ang_vel):
         scan_sub = scan_raw[::self.subsample_step].astype(np.float32)
         scan_sub = np.clip(scan_sub, 0.0, RANGE_MAX) / RANGE_MAX
-        obs = np.concatenate([scan_sub, [vel_x, ang_vel]], dtype=np.float32)
+        
+        # Explicitly cast to float32 for Python 3.12
+        v = np.float32(vel_x)
+        a = np.float32(ang_vel)
+        
+        obs = np.concatenate([scan_sub, [v, a]], dtype=np.float32)
         self.buffer[:-1] = self.buffer[1:]
         self.buffer[-1] = obs
 
@@ -96,46 +114,76 @@ class ObsBuffer:
         return self.buffer.copy()
 
 
-def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device, render=False):
-    obs, _, done, _ = env.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
+def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device,
+                render=False, deterministic=True, tracker=None):
+    """
+    Run one eval episode. If `tracker` (CenterlineTracker) is given, also reports
+    real lap-progress metrics — without this the agent could circle in place and
+    still score "clean 2000 steps".
+    """
+    # Use env.unwrapped.reset to bypass newer gym's strict API checks
+    obs, _, done, _ = env.unwrapped.reset(np.array([[start_pose[0], start_pose[1], start_pose[2]]]))
     obs_buf.reset()
     obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
     if render:
-        env.render(mode='human_fast')
-
-    prev_pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
+        env.unwrapped.render(mode='human_fast')
 
     total_reward = 0.0
     speeds = []
     step = 0
+    laps_completed = 0
+    forward_arc = 0.0
+    max_progress = 0.0  # furthest fractional lap progress (0..1) reached this episode
+
+    x0 = float(obs['poses_x'][0])
+    y0 = float(obs['poses_y'][0])
+    if tracker is not None:
+        tracker.reset(x0, y0)
+
+    from rl.ppo import raw_to_env_action
 
     while not done and step < max_steps:
         obs_seq = torch.from_numpy(obs_buf.get()).unsqueeze(0).to(device)
         with torch.no_grad():
             z = encoder(obs_seq)
-            action, _, _ = ac.get_action(z, deterministic=True)
+            action, _, _ = ac.get_action(z, deterministic=deterministic)
 
-        steer = float(np.clip(action[0, 0].cpu(), -0.4189, 0.4189))
-        speed = float(np.clip(action[0, 1].cpu(), 0.5, 5.0))
+        env_action = raw_to_env_action(action[0]).cpu().numpy()
+        steer = float(env_action[0])
+        speed = float(env_action[1])
 
-        obs, _, done, _ = env.step(np.array([[steer, speed]]))
+        obs, _, done, _ = env.unwrapped.step(np.array([[steer, speed]]))
         collision = bool(obs['collisions'][0])
+        vel_x = float(obs['linear_vels_x'][0])
 
-        curr_pose = [float(obs['poses_x'][0]), float(obs['poses_y'][0]), float(obs['poses_theta'][0])]
-        dx = curr_pose[0] - prev_pose[0]
-        dy = curr_pose[1] - prev_pose[1]
-        heading = prev_pose[2]
-        progress = dx * np.cos(heading) + dy * np.sin(heading)
-        reward = max(progress, 0.0) if not collision else -10.0
+        if collision:
+            reward = -100.0
+        else:
+            reward = 3.0 * max(vel_x, 0.0) * 0.01 + 0.1
 
         total_reward += reward
-        speeds.append(float(obs['linear_vels_x'][0]))
-        obs_buf.update(obs['scans'][0], float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
-        prev_pose = curr_pose
+        speeds.append(vel_x)
+
+        if tracker is not None:
+            x = float(obs['poses_x'][0])
+            y = float(obs['poses_y'][0])
+            th = float(obs['poses_theta'][0])
+            delta_arc, _, lap_complete, _, _, _ = tracker.step(x, y, th)
+            if delta_arc > 0:
+                forward_arc += float(delta_arc)
+            if lap_complete:
+                laps_completed += 1
+            if tracker.total_length > 0:
+                # progress_since_reset is accumulated forward arc since last reset/lap
+                frac = float(tracker._progress_since_reset) / float(tracker.total_length)
+                if frac > max_progress:
+                    max_progress = frac
+
+        obs_buf.update(obs['scans'][0], vel_x, float(obs['ang_vels_z'][0]))
         step += 1
 
         if render:
-            env.render(mode='human_fast')
+            env.unwrapped.render(mode='human_fast')
 
         if collision:
             break
@@ -146,6 +194,9 @@ def run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device, render
         'collided': bool(obs['collisions'][0]),
         'mean_speed': float(np.mean(speeds)) if speeds else 0.0,
         'max_speed': float(np.max(speeds)) if speeds else 0.0,
+        'forward_arc_m': forward_arc,
+        'max_progress_frac': max_progress,  # in [0, 1], best partial-lap completion
+        'laps_completed': laps_completed,
     }
 
 
@@ -157,7 +208,31 @@ MAP_INFO = {
 }
 
 
-def eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg, num_episodes, max_steps, device, render=False):
+def _load_tracker(map_name, cfg):
+    """
+    Try to load a CenterlineTracker for `map_name`. Returns None if no centerline
+    CSV exists for that map. The training centerlines folder uses inconsistent
+    naming (`vegas_centerline.csv`, `Austin_map_centerline.csv`), so we try a
+    couple of common forms.
+    """
+    from rl.rl_train import CenterlineTracker
+
+    cl_dir = cfg.get('rl', {}).get('centerline_dir', '')
+    if not cl_dir:
+        return None
+    candidates = [
+        f"{map_name}_centerline.csv",
+        f"{map_name.capitalize()}_map_centerline.csv",
+        f"{map_name}_map_centerline.csv",
+    ]
+    for fname in candidates:
+        full = os.path.join(cl_dir, fname)
+        if os.path.isfile(full):
+            return CenterlineTracker(full)
+    return None
+
+
+def eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg, num_episodes, max_steps, device, render=False, deterministic=True):
     import gym as openai_gym
     from f110_gym.envs.base_classes import Integrator
 
@@ -175,17 +250,30 @@ def eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg, num_episodes, max_st
         num_agents=1,
         timestep=0.01,
         integrator=Integrator.RK4,
+        disable_env_checker=True
     )
     start_pose = MAP_INFO[map_name]['start_pose']
+
+    tracker = _load_tracker(map_name, cfg)
+    if tracker is None:
+        print(f"  [WARN] no centerline CSV for '{map_name}' — progress metrics disabled.")
+
     results = []
 
     for ep in range(num_episodes):
         t0 = time.time()
-        r = run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device, render=render)
+        r = run_episode(env, encoder, ac, obs_buf, start_pose, max_steps, device,
+                        render=render, deterministic=deterministic, tracker=tracker)
         elapsed = time.time() - t0
         status = 'COLLISION' if r['collided'] else 'clean    '
-        print(f"  ep {ep+1:3d}: {r['steps']:5d} steps  {status}  "
-              f"reward {r['reward']:8.2f}  mean_spd {r['mean_speed']:.2f} m/s  ({elapsed:.1f}s)")
+        if tracker is not None:
+            print(f"  ep {ep+1:3d}: {r['steps']:5d} steps  {status}  "
+                  f"reward {r['reward']:8.2f}  mean_spd {r['mean_speed']:.2f} m/s  "
+                  f"arc {r['forward_arc_m']:6.1f} m  prog {100*r['max_progress_frac']:5.1f}%  "
+                  f"laps {r['laps_completed']}  ({elapsed:.1f}s)")
+        else:
+            print(f"  ep {ep+1:3d}: {r['steps']:5d} steps  {status}  "
+                  f"reward {r['reward']:8.2f}  mean_spd {r['mean_speed']:.2f} m/s  ({elapsed:.1f}s)")
         results.append(r)
 
     env.close()
@@ -199,12 +287,20 @@ def print_summary(map_name, results):
     rewards     = [r['reward']     for r in results]
     speeds      = [r['mean_speed'] for r in results]
     collisions  = sum(r['collided'] for r in results)
+    has_prog    = 'max_progress_frac' in results[0] and results[0].get('max_progress_frac') is not None
 
     print(f"\n  {map_name} summary ({len(results)} episodes):")
     print(f"    Collision rate : {collisions}/{len(results)} ({100*collisions/len(results):.0f}%)")
     print(f"    Steps          : min={min(steps)}  max={max(steps)}  mean={np.mean(steps):.0f}")
     print(f"    Reward         : min={min(rewards):.1f}  max={max(rewards):.1f}  mean={np.mean(rewards):.1f}")
     print(f"    Mean speed     : {np.mean(speeds):.2f} m/s")
+    if has_prog:
+        arcs   = [r['forward_arc_m']      for r in results]
+        progs  = [r['max_progress_frac']  for r in results]
+        laps   = [r['laps_completed']     for r in results]
+        print(f"    Forward arc    : min={min(arcs):.1f}  max={max(arcs):.1f}  mean={np.mean(arcs):.1f} m")
+        print(f"    Lap progress   : min={100*min(progs):.1f}%  max={100*max(progs):.1f}%  mean={100*np.mean(progs):.1f}%")
+        print(f"    Laps completed : total={sum(laps)}  best_ep={max(laps)}  mean={np.mean(laps):.2f}")
 
 
 def main():
@@ -215,6 +311,8 @@ def main():
     parser.add_argument('--maps',     nargs='+', default=['berlin', 'stata_basement', 'vegas'])
     parser.add_argument('--episodes', type=int, default=10)
     parser.add_argument('--render', action='store_true', help='Show live simulation window')
+    parser.add_argument('--stochastic', action='store_true',
+                        help='Sample actions from the policy instead of using the mean (more exploration)')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -236,7 +334,10 @@ def main():
         subsample_step=mc['lidar_subsample'],
     )
 
-    gym_path = os.path.join(GYM_PATH, 'gym')
+    gym_path = cfg.get('gym', {}).get('gym_path', GYM_PATH)
+    if not os.path.isabs(gym_path):
+        gym_path = os.path.join(PROJECT_ROOT, gym_path)
+    gym_path = os.path.join(gym_path, 'gym')
 
     for map_name in args.maps:
         if map_name not in MAP_INFO:
@@ -247,7 +348,7 @@ def main():
         print(f"{'='*60}")
         results = eval_map(map_name, gym_path, encoder, ac, obs_buf, cfg,
                            args.episodes, cfg['data_collection']['max_steps_per_episode'], device,
-                           render=args.render)
+                           render=args.render, deterministic=not args.stochastic)
         print_summary(map_name, results)
 
     print(f"\nDone.")

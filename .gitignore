@@ -1,3 +1,4 @@
 /data/
 /.claude/
-/__pychache__/
+/__pychache__/checkpoints/
+**/__pycache__/
