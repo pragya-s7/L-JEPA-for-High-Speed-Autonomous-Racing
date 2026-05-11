@@ -55,6 +55,7 @@ class LiDARTrajectoryDataset(Dataset):
         context_window:     h — steps fed to the encoder
         prediction_horizon: k — steps ahead to predict
         maps:               list of map names to include (None = all found)
+        exclude_maps:       list of map names to skip (applied after `maps`)
     """
 
     def __init__(
@@ -63,6 +64,7 @@ class LiDARTrajectoryDataset(Dataset):
         context_window: int = 4,
         prediction_horizon: int = 5,
         maps: list = None,
+        exclude_maps: list = None,
     ):
         self.h = context_window
         self.k = prediction_horizon
@@ -73,6 +75,22 @@ class LiDARTrajectoryDataset(Dataset):
         else:
             search_dirs = sorted(glob.glob(os.path.join(data_dir, '*')))
             search_dirs = [d for d in search_dirs if os.path.isdir(d)]
+
+        # Filter excluded maps (case-insensitive, substring match so 'levine'
+        # also catches things like 'levine_v2').
+        excluded_norm = [m.lower() for m in (exclude_maps or [])]
+        if excluded_norm:
+            kept = []
+            skipped = []
+            for d in search_dirs:
+                name_l = os.path.basename(d).lower()
+                if any(ex in name_l for ex in excluded_norm):
+                    skipped.append(os.path.basename(d))
+                else:
+                    kept.append(d)
+            if skipped:
+                print(f"[Dataset] Excluding maps: {skipped}")
+            search_dirs = kept
 
         if not search_dirs:
             raise FileNotFoundError(
@@ -138,6 +156,7 @@ def make_dataloader(
     prediction_horizon: int,
     batch_size: int,
     maps: list = None,
+    exclude_maps: list = None,
     num_workers: int = 4,
     shuffle: bool = True,
 ) -> tuple:
@@ -146,6 +165,7 @@ def make_dataloader(
         context_window=context_window,
         prediction_horizon=prediction_horizon,
         maps=maps,
+        exclude_maps=exclude_maps,
     )
     loader = DataLoader(
         dataset,

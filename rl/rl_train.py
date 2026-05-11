@@ -25,14 +25,23 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-GYM_PATH = '/home/pragya/f1tenth_gym'
-if GYM_PATH not in sys.path:
-    sys.path.insert(0, os.path.join(GYM_PATH, 'gym'))
+_CFG_BOOT = os.path.join(PROJECT_ROOT, 'config.yaml')
+_GYM_ROOT = ''
+if os.path.isfile(_CFG_BOOT):
+    with open(_CFG_BOOT) as _bf:
+        _boot = yaml.safe_load(_bf)
+    _GYM_ROOT = (_boot.get('gym') or {}).get('gym_path', '') or os.environ.get('F1TENTH_GYM', '')
+if _GYM_ROOT and not os.path.isabs(_GYM_ROOT):
+    _GYM_ROOT = os.path.join(PROJECT_ROOT, _GYM_ROOT)
+GYM_PATH = _GYM_ROOT or '/home/yim/f1tenth_gym'
+_sys_gym_pkg = os.path.join(GYM_PATH, 'gym')
+if _sys_gym_pkg not in sys.path:
+    sys.path.insert(0, _sys_gym_pkg)
 
 import gym
 from f110_gym.envs.base_classes import Integrator
 from models import ContextEncoder
-from rl.ppo import PPO
+from rl.ppo import PPO, raw_to_env_action, STEER_LIMIT, SPEED_LOW, SPEED_HIGH
 
 
 # LiDAR constants (must match collect_data.py)
@@ -105,60 +114,180 @@ class ObsBuffer:
 
 class CenterlineTracker:
     """
-    Tracks a car's arc-length progress and lateral deviation along a pre-built
-    centerline CSV (columns: s_m; x_m; y_m).
+    Tracks arc-length progress and lateral deviation along a centerline CSV
+    (columns: s_m; x_m; y_m).
 
-    For closed-loop tracks (loop_gap < 5 m) the arc-length delta wraps around
-    correctly at the finish line.  For open-ended centerlines (e.g. stata_basement
-    where one episode doesn't cover a full lap) wrap-around is disabled and the
-    tracker simply accumulates forward progress within each episode.
+    Uses sequential waypoint association (local window around last index) instead
+    of pure nearest-neighbour on (x,y). That reduces ambiguous jumps on concave /
+    self-overlapping layouts where global NN picks the wrong branch.
+
+    For closed loops (endpoints close) arc-length delta wraps at the cut.
     """
 
     _CLOSED_GAP_M = 5.0
+    _SEQ_WINDOW = 80
+    _FALLBACK_DIST_M = 3.0
 
     def __init__(self, csv_path):
         data = np.loadtxt(csv_path, delimiter=';', skiprows=1)
         self.s = data[:, 0].astype(np.float32)
         self.x = data[:, 1].astype(np.float32)
         self.y = data[:, 2].astype(np.float32)
+        # CSV layout: s_m;x_m;y_m;psi_rad;kappa_m;v_mps. We load psi_rad so
+        # sample_random_pose() can spawn the car aligned with the track
+        # tangent. Falls back to computed tangent if absent.
+        if data.shape[1] >= 4:
+            self.psi = data[:, 3].astype(np.float32)
+        else:
+            self.psi = None
+        self.n = len(self.s)
         self.total_length = float(self.s[-1])
         self._tree = cKDTree(np.column_stack([self.x, self.y]))
         self._last_s = None
+        self._last_idx = None
 
         loop_gap = float(np.hypot(self.x[-1] - self.x[0], self.y[-1] - self.y[0]))
         self.is_closed = loop_gap < self._CLOSED_GAP_M
-        print(f"    centerline: {len(self.s)} wp  length={self.total_length:.1f}m  "
-              f"{'closed' if self.is_closed else 'open (no wrap-around)'}")
+        print(f"    centerline: {self.n} wp  length={self.total_length:.1f}m  "
+              f"{'closed' if self.is_closed else 'open (no wrap-around)'}  "
+              f"(sequential tracking)")
+
+    def sample_random_pose(self, rng=None, margin_frac=0.02):
+        """
+        Return a random (x, y, theta) on the centerline. Used to break out of
+        local-minima training where the policy always crashes at the same
+        on-track location and never gets to learn the rest of the track.
+
+        margin_frac: avoid the very first/last few % of waypoints on open
+            tracks so a backward-facing spawn doesn't immediately crash.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        if self.n <= 2:
+            return float(self.x[0]), float(self.y[0]), 0.0
+
+        if self.is_closed:
+            idx = int(rng.integers(0, self.n))
+        else:
+            lo = max(1, int(margin_frac * self.n))
+            hi = max(lo + 1, self.n - lo)
+            idx = int(rng.integers(lo, hi))
+
+        x = float(self.x[idx])
+        y = float(self.y[idx])
+
+        if self.psi is not None:
+            theta = float(self.psi[idx])
+        else:
+            # Fall back to a discrete tangent from neighbouring waypoints
+            if self.is_closed:
+                ip = (idx - 1) % self.n
+                iq = (idx + 1) % self.n
+            else:
+                ip = max(0, idx - 1)
+                iq = min(self.n - 1, idx + 1)
+            tx = float(self.x[iq] - self.x[ip])
+            ty = float(self.y[iq] - self.y[ip])
+            theta = float(np.arctan2(ty, tx))
+        return x, y, theta
 
     def reset(self, x, y):
         _, idx = self._tree.query([x, y])
-        self._last_s = float(self.s[idx])
+        self._last_idx = int(idx)
+        self._last_s = float(self.s[self._last_idx])
+        # Tracks total forward progress since last reset; lap_complete is only
+        # allowed to fire after the agent has actually driven most of the way
+        # around the loop. Without this guard a sequential-association glitch
+        # (idx jumping from near the end back to near the start) would falsely
+        # award the lap_bonus.
+        self._progress_since_reset = 0.0
 
-    def step(self, x, y):
-        """Returns (delta_arc_m, lateral_m, lap_complete)."""
-        lateral, idx = self._tree.query([x, y])
+    def _nearest_idx_sequential(self, x, y):
+        """Prefer neighbors of last idx so progress stays on one polyline branch."""
+        if self._last_idx is None:
+            _, idx = self._tree.query([x, y])
+            return int(idx)
+
+        best_d = float('inf')
+        best_i = self._last_idx
+        W = self._SEQ_WINDOW
+        for di in range(-W, W + 1):
+            i = self._last_idx + di
+            if self.is_closed:
+                i = i % self.n
+            elif i < 0 or i >= self.n:
+                continue
+            dx = float(x) - float(self.x[i])
+            dy = float(y) - float(self.y[i])
+            d = float(np.hypot(dx, dy))
+            if d < best_d:
+                best_d = d
+                best_i = i
+
+        if best_d > self._FALLBACK_DIST_M:
+            _, j = self._tree.query([x, y])
+            best_i = int(j)
+        return best_i
+
+    def _heading_error_rad(self, idx, theta):
+        """Angle between vehicle heading and centerline tangent at waypoint idx."""
+        if self.is_closed:
+            ip = (idx - 1) % self.n
+            iq = (idx + 1) % self.n
+        else:
+            ip = max(0, idx - 1)
+            iq = min(self.n - 1, idx + 1)
+        tx = float(self.x[iq] - self.x[ip])
+        ty = float(self.y[iq] - self.y[ip])
+        if tx == 0.0 and ty == 0.0:
+            return 0.0
+        tangent = np.arctan2(ty, tx)
+        err = float(theta) - tangent
+        err = (err + np.pi) % (2 * np.pi) - np.pi
+        return err
+
+    def step(self, x, y, theta):
+        """
+        Returns:
+            delta_arc_m, lateral_m, lap_complete,
+            heading_err_rad, prev_arc_s, curr_arc_s
+        """
+        prev_arc_s = self._last_s
+        idx = self._nearest_idx_sequential(x, y)
+        self._last_idx = idx
+
+        lateral = float(np.hypot(float(x) - float(self.x[idx]), float(y) - float(self.y[idx])))
         curr_s = float(self.s[idx])
-        if self._last_s is None:
-            self._last_s = curr_s
-            return 0.0, float(lateral), False
-        
-        delta_s = curr_s - self._last_s
-        lap_complete = False
-        
-        # Handle wrap-around for closed tracks
+        heading_err = self._heading_error_rad(idx, theta)
+
+        delta_s = curr_s - prev_arc_s
+        wrap_detected = False
+
         if self.is_closed:
             half = self.total_length / 2.0
             if delta_s > half:
                 delta_s -= self.total_length
             elif delta_s < -half:
                 delta_s += self.total_length
-                lap_complete = True # Detected wrap-around
-        
-        # CRITICAL: Cap delta_s to prevent massive reward spikes
-        delta_s = np.clip(delta_s, -1.0, 1.0)
-        
+                wrap_detected = True
+
+        delta_s = float(np.clip(delta_s, -1.0, 1.0))
         self._last_s = curr_s
-        return delta_s, float(lateral), lap_complete
+        if delta_s > 0:
+            self._progress_since_reset += delta_s
+
+        # Require ~80% of a full lap of accumulated forward progress to call it
+        # a lap. This rejects spurious wraps caused by waypoint association
+        # jumps near self-overlapping geometry.
+        lap_complete = bool(
+            wrap_detected
+            and self.is_closed
+            and self._progress_since_reset >= 0.8 * self.total_length
+        )
+        if lap_complete:
+            self._progress_since_reset = 0.0  # rearm for next lap
+
+        return delta_s, lateral, lap_complete, heading_err, prev_arc_s, curr_s
 
 
 def make_env(map_path, map_ext, timestep):
@@ -274,68 +403,99 @@ class BacktrackBuffer:
         return self.current_backtracks
 
 
-def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_complete, reward_cfg, tracker=None):
-    """State-of-the-art reward function for F1TENTH RL."""
+def compute_reward(
+    delta_arc,
+    lateral,
+    collision,
+    vel_x,
+    steer,
+    prev_steer,
+    lap_complete,
+    reward_cfg,
+    tracker=None,
+    heading_err_rad=0.0,
+    prev_arc_s=None,
+    curr_arc_s=None,
+):
+    """
+    Hybrid dense + sparse lap bonus. Tuned to avoid rewarding:
+      - idling / endless survival (no positive survival bonus by default),
+      - high speed without forward track progress (speed gated),
+      - crashing early still yields large negative return via collision_penalty + little accumulation.
+
+    Progress uses centerline arc coordinate with sequential association (see CenterlineTracker).
+    """
     if collision:
-        return reward_cfg['collision_penalty']
-    
+        return float(reward_cfg['collision_penalty'])
+
     reward_type = reward_cfg.get('type', 'dense')
-    
+    nbins = int(reward_cfg.get('progress_bins', 10))
+
     if reward_type == 'sparse':
-        # Sparse reward: milestones based on total track length
-        if tracker is None or tracker.total_length == 0:
+        if tracker is None or tracker.total_length <= 0:
             return 0.0
-        
-        # Checkpoint reward: every 10% of the track
-        prev_progress = (tracker._last_s - delta_arc) / tracker.total_length
-        curr_progress = tracker._last_s / tracker.total_length
-        
-        # If we crossed a 0.1 boundary
+        if prev_arc_s is None or curr_arc_s is None:
+            return 0.0
+        prev_progress = float(prev_arc_s) / tracker.total_length
+        curr_progress = float(curr_arc_s) / tracker.total_length
         r = 0.0
-        if int(curr_progress * 10) > int(prev_progress * 10):
-            r += reward_cfg.get('checkpoint_reward', 1.0)
-            
-        # Lap bonus (if we wrapped around)
+        if int(curr_progress * nbins + 1e-9) > int(prev_progress * nbins + 1e-9):
+            r += float(reward_cfg.get('checkpoint_reward', 1.0))
         if lap_complete:
-            r += reward_cfg.get('lap_bonus', 1000.0)
-            
+            r += float(reward_cfg.get('lap_bonus', 1000.0))
         return float(r)
+
+    pw = float(reward_cfg.get('progress_weight', 10.0))
+    if delta_arc >= 0:
+        r = pw * delta_arc
     else:
-        # State-of-the-art Hybrid Dense Reward
-        if delta_arc >= 0:
-            r = reward_cfg.get('progress_weight', 10.0) * delta_arc
-        else:
-            r = reward_cfg.get('progress_weight', 10.0) * delta_arc * 5.0
-            
-        r -= reward_cfg.get('deviation_weight', 0.1) * lateral
-        r += reward_cfg.get('speed_weight', 0.1) * max(0.0, vel_x)
-        
-        if prev_steer is not None:
-            r -= reward_cfg.get('steer_penalty', 0.2) * abs(steer - prev_steer)
-            
-        r += reward_cfg.get('survival_reward', 0.1)
+        r = pw * float(delta_arc) * float(reward_cfg.get('wrong_way_multiplier', 5.0))
 
-        # Apply big lap bonus if we wrapped around
-        if lap_complete:
-            r += reward_cfg.get('lap_bonus', 1000.0)
-            
-        return float(r)
+    r -= float(reward_cfg.get('deviation_weight', 0.1)) * float(lateral)
 
+    min_df = float(reward_cfg.get('speed_requires_forward_delta_m', 0.03))
+    if delta_arc >= min_df:
+        r += float(reward_cfg.get('speed_weight', 0.0)) * max(0.0, vel_x)
 
-def compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg):
-    """vel_x fallback for maps without a centerline."""
-    if collision:
-        return reward_cfg['collision_penalty']
-    
-    r = reward_cfg.get('progress_weight', 5.0) * max(float(vel_x), 0.0) * 0.01
+    hw = float(reward_cfg.get('heading_weight', 0.0))
+    if hw > 0.0:
+        r -= hw * min(abs(float(heading_err_rad)), float(np.pi))
+
     if prev_steer is not None:
-        r -= reward_cfg.get('steer_penalty', 0.0) * abs(steer - prev_steer)
+        r -= float(reward_cfg.get('steer_penalty', 0.2)) * abs(steer - prev_steer)
+
+    r += float(reward_cfg.get('survival_reward', 0.0))
+    r += float(reward_cfg.get('time_penalty_per_step', 0.0))
+
+    dcb = float(reward_cfg.get('dense_checkpoint_bonus', 0.0))
+    if dcb > 0.0 and tracker is not None and prev_arc_s is not None and curr_arc_s is not None:
+        tl = tracker.total_length
+        if int(float(curr_arc_s) / tl * nbins + 1e-9) > int(float(prev_arc_s) / tl * nbins + 1e-9):
+            r += dcb
+
+    if lap_complete:
+        r += float(reward_cfg.get('lap_bonus', 1000.0))
+
     return float(r)
 
 
-def clamp_action(steer, speed):
-    # Reduced max speed slightly to 4.5m/s to prevent RK4 integrator explosions at high slip angles
-    return float(np.clip(steer, -0.4189, 0.4189)), float(np.clip(speed, 0.5, 4.5))
+def compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg):
+    """Weak shaping when no centerline CSV exists — prefer generating centerlines instead."""
+    if collision:
+        return float(reward_cfg['collision_penalty'])
+
+    r = float(reward_cfg.get('fallback_vel_scale', 0.02)) * max(float(vel_x), 0.0)
+    if prev_steer is not None:
+        r -= float(reward_cfg.get('steer_penalty', 0.0)) * abs(steer - prev_steer)
+    r += float(reward_cfg.get('survival_reward', 0.0))
+    r += float(reward_cfg.get('time_penalty_per_step', 0.0))
+    return float(r)
+
+
+def raw_action_to_env(raw_action_np):
+    """Map a 2-vector raw action sample to (env_steer, env_speed)."""
+    env_action = raw_to_env_action(raw_action_np)
+    return float(env_action[0]), float(env_action[1])
 
 
 def build_map_pool(cfg):
@@ -374,12 +534,21 @@ def build_map_pool(cfg):
     for m in training_maps:
         path = m['map_path']
         ext  = m.get('map_ext', '.png')
+        weight = float(m.get('weight', 1.0))
+        if weight <= 0:
+            print(f"  [SKIP] map disabled (weight={weight}): {m['name']}")
+            continue
         if not os.path.exists(path + ext):
             print(f"  [SKIP] map not found: {path}{ext}")
             continue
-        print(f"  Loading map: {m['name']}")
+        print(f"  Loading map: {m['name']}  (weight={weight:g})")
         env = make_env(path, ext, timestep)
-        entry = {'env': env, 'start_pose': m['start_pose'], 'name': m['name']}
+        entry = {
+            'env': env,
+            'start_pose': m['start_pose'],
+            'name': m['name'],
+            'weight': weight,
+        }
 
         cl_path = os.path.join(centerline_dir, f"{m['name']}_centerline.csv") if centerline_dir else ''
         if cl_path and os.path.exists(cl_path):
@@ -387,23 +556,58 @@ def build_map_pool(cfg):
         else:
             print(f"    no centerline found — using vel_x fallback reward")
 
+        entry['randomize_start'] = bool(m.get('randomize_start', False))
+        if entry['randomize_start'] and 'tracker' not in entry:
+            print(f"    [warn] randomize_start=True but no centerline for {m['name']} — "
+                  f"will fall back to fixed start_pose")
         pool.append(entry)
 
     if not pool:
         raise RuntimeError("No valid training maps found. Check paths in config.yaml.")
-    return pool
+
+    weights = np.array([m['weight'] for m in pool], dtype=np.float64)
+    if not np.all(weights > 0):
+        raise RuntimeError(f"Map weights must be > 0. Got: {weights}")
+    probs = weights / weights.sum()
+    pct = ", ".join(f"{m['name']}={100*p:.0f}%" for m, p in zip(pool, probs))
+    print(f"Map sampling weights: {pct}")
+    return pool, probs
 
 
-def train(cfg_path, encoder_path_override=None):
+def train(cfg_path, encoder_path_override=None, checkpoint_dir_override=None,
+          total_steps_override=None, resume_path=None, maps_override=None):
     cfg = load_config(cfg_path)
     mc = cfg['model']
     rl_cfg = cfg['rl']
     reward_cfg = rl_cfg['reward']
 
+    if checkpoint_dir_override:
+        rl_cfg['checkpoint_dir'] = checkpoint_dir_override
+        os.makedirs(rl_cfg['checkpoint_dir'], exist_ok=True)
+    if total_steps_override is not None:
+        rl_cfg['total_steps'] = int(total_steps_override)
+
+    # Allow --maps to whitelist a subset of training_maps from config (used for
+    # curriculum learning: e.g. --maps vegas trains on vegas only).
+    if maps_override:
+        whitelist = {m.lower() for m in maps_override}
+        original = rl_cfg.get('training_maps', []) or []
+        filtered = [m for m in original if m['name'].lower() in whitelist]
+        if not filtered:
+            raise RuntimeError(
+                f"--maps={maps_override} matched none of "
+                f"{[m['name'] for m in original]}"
+            )
+        rl_cfg['training_maps'] = filtered
+        print(f"Training maps overridden: {[m['name'] for m in filtered]}")
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
     encoder_path = encoder_path_override or rl_cfg['encoder_checkpoint']
+    print(f"Encoder checkpoint: {encoder_path}")
+    print(f"RL save directory:    {rl_cfg['checkpoint_dir']}")
+    print(f"Total env steps:      {rl_cfg['total_steps']:,}")
     encoder = load_encoder(encoder_path, cfg, device)
 
     ppo = PPO(
@@ -424,8 +628,32 @@ def train(cfg_path, encoder_path_override=None):
     )
     print(f"PPO actor-critic: {sum(p.numel() for p in ppo.ac.parameters()):,} parameters")
 
+    if resume_path:
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"--resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        ppo.ac.load_state_dict(ckpt['actor_critic_state_dict'])
+        if 'optimizer_state_dict' in ckpt:
+            try:
+                ppo.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            except (ValueError, KeyError) as e:
+                print(f"  [warn] could not restore optimizer state: {e}")
+        # `optimizer.load_state_dict` overwrites lr with the lr that was used
+        # when the checkpoint was saved. For fine-tuning we want the lr from
+        # the *current* config to take effect (typically smaller). Force it.
+        new_lr = float(rl_cfg['lr'])
+        for g in ppo.optimizer.param_groups:
+            g['lr'] = new_lr
+        prev_update = int(ckpt.get('update', 0))
+        prev_steps  = int(ckpt.get('total_steps', 0))
+        prev_reward = float(ckpt.get('mean_reward', float('-inf')))
+        print(f"Resumed from {resume_path} "
+              f"(prev update {prev_update}, prev steps {prev_steps:,}, "
+              f"prev mean_reward {prev_reward:.2f})")
+        print(f"  Forcing lr = {new_lr} on all param groups for fine-tuning.")
+
     print("\nBuilding map pool...")
-    map_pool = build_map_pool(cfg)
+    map_pool, map_probs = build_map_pool(cfg)
     print(f"Training on {len(map_pool)} map(s): {[m['name'] for m in map_pool]}")
 
     obs_buf = ObsBuffer(
@@ -447,10 +675,23 @@ def train(cfg_path, encoder_path_override=None):
 
     rng = np.random.default_rng(seed=0)
 
-    # Start on a random map
-    current_map = map_pool[rng.integers(len(map_pool))]
+    def pick_start_pose(map_entry):
+        """
+        Return [x, y, theta] for a fresh reset on `map_entry`.
+        If randomize_start is True and a centerline tracker is loaded, sample
+        a random waypoint on the centerline so the policy gets to practice the
+        whole track instead of crashing at the same spot every episode.
+        """
+        tr = map_entry.get('tracker')
+        if map_entry.get('randomize_start', False) and tr is not None:
+            x, y, th = tr.sample_random_pose(rng)
+            return [x, y, th]
+        return list(map_entry['start_pose'])
+
+    # Start on a random map (weighted by training_maps[*].weight)
+    current_map = map_pool[rng.choice(len(map_pool), p=map_probs)]
     env = current_map['env']
-    start_pose = current_map['start_pose']
+    start_pose = pick_start_pose(current_map)
 
     randomizer.randomize(env)
     # Satisfy newer gym's OrderEnforcing wrapper by manually setting its internal flag
@@ -489,7 +730,8 @@ def train(cfg_path, encoder_path_override=None):
                 z = encoder(obs_seq)
 
             action_t, log_prob, value = ppo.act(z)
-            steer, speed = clamp_action(float(action_t[0, 0].cpu()), float(action_t[0, 1].cpu()))
+            raw_np = action_t[0].detach().cpu().numpy()
+            steer, speed = raw_action_to_env(raw_np)
             
             # Apply action delay (DR)
             delayed_action = randomizer.apply_action_delay(np.array([steer, speed], dtype=np.float32))
@@ -510,8 +752,23 @@ def train(cfg_path, encoder_path_override=None):
             backtracker.add(pose)
 
             if tracker is not None:
-                delta_arc, lateral, lap_complete = tracker.step(pose[0], pose[1])
-                reward = compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_complete, reward_cfg, tracker=tracker)
+                delta_arc, lateral, lap_complete, heading_err, prev_arc_s, curr_arc_s = tracker.step(
+                    pose[0], pose[1], pose[2]
+                )
+                reward = compute_reward(
+                    delta_arc,
+                    lateral,
+                    collision,
+                    vel_x,
+                    steer,
+                    prev_steer,
+                    lap_complete,
+                    reward_cfg,
+                    tracker=tracker,
+                    heading_err_rad=heading_err,
+                    prev_arc_s=prev_arc_s,
+                    curr_arc_s=curr_arc_s,
+                )
             else:
                 reward = compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg)
 
@@ -560,9 +817,9 @@ def train(cfg_path, encoder_path_override=None):
                     episode_count += 1
                     map_counts[current_map['name']] += 1
                     
-                    current_map = map_pool[rng.integers(len(map_pool))]
+                    current_map = map_pool[rng.choice(len(map_pool), p=map_probs)]
                     env = current_map['env']
-                    start_pose = current_map['start_pose']
+                    start_pose = pick_start_pose(current_map)
                     randomizer.randomize(env)
 
                     if hasattr(env, '_has_reset'): env._has_reset = True
@@ -632,8 +889,37 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default=os.path.join(PROJECT_ROOT, 'config.yaml'))
     parser.add_argument('--encoder', default=None)
+    parser.add_argument(
+        '--checkpoint-dir',
+        default=None,
+        help='Override rl.checkpoint_dir so parallel encoder experiments do not overwrite each other.',
+    )
+    parser.add_argument(
+        '--total-steps',
+        type=int,
+        default=None,
+        help='Override rl.total_steps (default: value from config.yaml).',
+    )
+    parser.add_argument(
+        '--resume',
+        default=None,
+        help='Path to a previous best.pt / update_xxxxx.pt to warm-start the actor-critic.',
+    )
+    parser.add_argument(
+        '--maps',
+        nargs='+',
+        default=None,
+        help='Whitelist subset of rl.training_maps by name (curriculum learning).',
+    )
     args = parser.parse_args()
-    train(args.config, encoder_path_override=args.encoder)
+    train(
+        args.config,
+        encoder_path_override=args.encoder,
+        checkpoint_dir_override=args.checkpoint_dir,
+        total_steps_override=args.total_steps,
+        resume_path=args.resume,
+        maps_override=args.maps,
+    )
 
 
 if __name__ == '__main__':

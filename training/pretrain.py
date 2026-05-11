@@ -65,12 +65,14 @@ def train(cfg_path):
     print(f"Device: {device}")
 
     # Data
-    data_dir = dc['output_dir']
+    data_dir = pc.get('data_dir', dc['output_dir'])
     loader, dataset = make_dataloader(
         data_dir=data_dir,
         context_window=mc['context_window'],
         prediction_horizon=pc.get('prediction_horizon', dc.get('prediction_horizon', 5)),
         batch_size=pc['batch_size'],
+        maps=pc.get('maps'),
+        exclude_maps=pc.get('exclude_maps'),
         num_workers=min(4, os.cpu_count() or 1),
     )
     print(f"Dataset: {len(dataset)} samples, {len(loader)} batches/epoch")

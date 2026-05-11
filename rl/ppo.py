@@ -5,12 +5,19 @@ The actor and critic operate on latent vectors z produced by the frozen
 ContextEncoder, not on raw LiDAR scans. This keeps both networks small and
 inference fast.
 
-Action space: [steer, speed] — both continuous.
-  steer ∈ [-steer_limit, steer_limit] ≈ [-0.4189, 0.4189] rad
-  speed ∈ [v_min, v_max] ≈ [0.5, 5.0] m/s
+Policy output convention (IMPORTANT):
+  The actor produces a raw action in unbounded R^2 sampled from
+  Normal(mu, std) where std = exp(log_std). PPO computes log-probabilities,
+  ratios and advantages in this *raw* space — i.e. the rollout buffer always
+  stores raw actions, not env-space actions. Before being sent to the
+  simulator, raw actions are transformed by `raw_to_env_action`:
 
-Both actions are sampled from independent diagonal Gaussians. The policy
-outputs (mu_steer, mu_speed) and log_std parameters.
+      env_steer  = clamp(raw[0] * STEER_LIMIT,             -STEER_LIMIT, +STEER_LIMIT)
+      env_speed  = clamp(raw[1] * SPEED_HALF + SPEED_MID,    SPEED_LOW,    SPEED_HIGH)
+
+  At init the policy outputs raw ≈ 0 so env_speed ≈ SPEED_MID (safe mid-range)
+  rather than getting saturated at the lower clip — which was the cause of the
+  "agent crawls at 0.5 m/s forever" failure mode of the earlier training run.
 """
 import numpy as np
 import torch
@@ -21,6 +28,53 @@ from torch.distributions import Normal
 
 LOG_STD_MIN = -3.0
 LOG_STD_MAX = 0.5
+
+# Action ranges (must match the f1tenth_gym kinematic limits).
+STEER_LIMIT = 0.4189            # rad
+SPEED_LOW   = 0.5               # m/s
+# Stage 9 curriculum: SPEED_HIGH lowered from 4.5 → 2.5 m/s. The unrestricted
+# 4.5 m/s policy can't physically brake fast enough for berlin's tight
+# corners, so PPO converged on "drive at 4.3 m/s into the same wall every
+# episode". By capping the action space we force the policy to operate at
+# speeds where the corners are physically navigable; once it learns to
+# complete a lap at 2.5 m/s the cap can be raised in a follow-up stage.
+SPEED_HIGH  = 2.5               # m/s — Stage 9 curriculum cap (was 4.5)
+SPEED_MID   = 0.5 * (SPEED_LOW + SPEED_HIGH)        # 1.5 m/s
+SPEED_HALF  = 0.5 * (SPEED_HIGH - SPEED_LOW)        # 1.0 m/s
+
+# Pre-built tensors for the GPU path; produced lazily so a CPU-only test still works.
+_TENSOR_CACHE: dict = {}
+
+
+def _get_action_tensors(device, dtype):
+    key = (device, dtype)
+    if key not in _TENSOR_CACHE:
+        _TENSOR_CACHE[key] = (
+            torch.tensor([STEER_LIMIT, SPEED_HALF], device=device, dtype=dtype),
+            torch.tensor([0.0,         SPEED_MID],  device=device, dtype=dtype),
+            torch.tensor([-STEER_LIMIT, SPEED_LOW], device=device, dtype=dtype),
+            torch.tensor([+STEER_LIMIT, SPEED_HIGH], device=device, dtype=dtype),
+        )
+    return _TENSOR_CACHE[key]
+
+
+def raw_to_env_action(raw_action):
+    """
+    Map an unbounded raw action to the simulator's [steer, speed].
+
+    Accepts either a 1D/2D torch.Tensor or a numpy array / list of length 2.
+    """
+    if isinstance(raw_action, torch.Tensor):
+        scale, bias, low, high = _get_action_tensors(raw_action.device, raw_action.dtype)
+        env_action = raw_action * scale + bias
+        return torch.maximum(low, torch.minimum(env_action, high))
+    arr = np.asarray(raw_action, dtype=np.float32)
+    scale = np.array([STEER_LIMIT, SPEED_HALF], dtype=np.float32)
+    bias  = np.array([0.0,         SPEED_MID],  dtype=np.float32)
+    out = arr * scale + bias
+    out[..., 0] = np.clip(out[..., 0], -STEER_LIMIT, +STEER_LIMIT)
+    out[..., 1] = np.clip(out[..., 1],  SPEED_LOW,    SPEED_HIGH)
+    return out
 
 
 class ActorCritic(nn.Module):
