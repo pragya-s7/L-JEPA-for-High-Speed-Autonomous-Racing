@@ -274,7 +274,7 @@ class BacktrackBuffer:
         return self.current_backtracks
 
 
-def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_complete, reward_cfg, tracker=None):
+def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_complete, reward_cfg, tracker=None, scan=None):
     """State-of-the-art reward function for F1TENTH RL."""
     if collision:
         return reward_cfg['collision_penalty']
@@ -315,6 +315,14 @@ def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_
             
         r += reward_cfg.get('survival_reward', 0.1)
 
+        # Wall Proximity Penalty (from repo)
+        if scan is not None and reward_cfg.get('wall_penalty', 0.0) > 0:
+            min_dist = np.min(scan)
+            threshold = reward_cfg.get('wall_threshold', 0.5)
+            if min_dist < threshold:
+                penalty = 1.0 - (min_dist / threshold)
+                r -= reward_cfg['wall_penalty'] * penalty
+
         # Apply big lap bonus if we wrapped around
         if lap_complete:
             r += reward_cfg.get('lap_bonus', 1000.0)
@@ -322,7 +330,7 @@ def compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_
         return float(r)
 
 
-def compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg):
+def compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg, scan=None):
     """vel_x fallback for maps without a centerline."""
     if collision:
         return reward_cfg['collision_penalty']
@@ -330,6 +338,14 @@ def compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg):
     r = reward_cfg.get('progress_weight', 5.0) * max(float(vel_x), 0.0) * 0.01
     if prev_steer is not None:
         r -= reward_cfg.get('steer_penalty', 0.0) * abs(steer - prev_steer)
+
+    if scan is not None and reward_cfg.get('wall_penalty', 0.0) > 0:
+        min_dist = np.min(scan)
+        threshold = reward_cfg.get('wall_threshold', 0.5)
+        if min_dist < threshold:
+            penalty = 1.0 - (min_dist / threshold)
+            r -= reward_cfg['wall_penalty'] * penalty
+
     return float(r)
 
 
@@ -511,9 +527,9 @@ def train(cfg_path, encoder_path_override=None):
 
             if tracker is not None:
                 delta_arc, lateral, lap_complete = tracker.step(pose[0], pose[1])
-                reward = compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_complete, reward_cfg, tracker=tracker)
+                reward = compute_reward(delta_arc, lateral, collision, vel_x, steer, prev_steer, lap_complete, reward_cfg, tracker=tracker, scan=obs['scans'][0])
             else:
-                reward = compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg)
+                reward = compute_reward_fallback(vel_x, collision, steer, prev_steer, reward_cfg, scan=obs['scans'][0])
 
             prev_steer = steer
 
@@ -533,37 +549,32 @@ def train(cfg_path, encoder_path_override=None):
             timeout = ep_len >= cfg['data_collection'].get('max_steps_per_episode', 3000)
 
             if done or collision or timeout:
-                # If collision, try backtracking first
-                bt_enabled = rl_cfg.get('backtrack', {}).get('enabled', False)
-                bt_pose = backtracker.get_backtrack_pose()
+                # Full episode reset
+                ep_rewards.append(ep_reward)
+                ep_lengths.append(ep_len)
+                episode_count += 1
+                map_counts[current_map['name']] += 1
                 
-                if collision and bt_enabled and bt_pose and not timeout and backtracker.increment_count() <= backtracker.max_backtracks:
-                    # Backtrack reset
-                    if hasattr(env, '_has_reset'): env._has_reset = True
-                    elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'): env.env._has_reset = True
-                    
-                    obs, _, done, _ = env.unwrapped.reset(np.array([bt_pose]))
-                    prev_steer = 0.0
-                    
-                    # Resync temporal buffer
-                    obs_buf.reset()
-                    scan_noise = randomizer.apply_sensor_noise(obs['scans'][0])
-                    for _ in range(mc['context_window']):
-                        obs_buf.update(scan_noise, float(obs['linear_vels_x'][0]), float(obs['ang_vels_z'][0]))
-                    
-                    if tracker is not None:
-                        tracker.reset(float(obs['poses_x'][0]), float(obs['poses_y'][0]))
+                current_map = map_pool[rng.integers(len(map_pool))]
+                env = current_map['env']
+                
+                # Curriculum Spawning
+                tracker = current_map.get('tracker')
+                if tracker is not None:
+                    # Randomize start point based on training progress (0.0 to 1.0)
+                    progress_ratio = min(1.0, total_steps / (rl_cfg['total_steps'] * 0.5))
+                    if rng.random() < progress_ratio:
+                        # Spawn at random waypoint
+                        idx = rng.integers(len(tracker.x) - 1)
+                        # Alignment: face the next waypoint
+                        theta = np.arctan2(tracker.y[idx+1] - tracker.y[idx], tracker.x[idx+1] - tracker.x[idx])
+                        start_pose = [tracker.x[idx], tracker.y[idx], theta]
+                    else:
+                        start_pose = current_map['start_pose']
                 else:
-                    # Full episode reset
-                    ep_rewards.append(ep_reward)
-                    ep_lengths.append(ep_len)
-                    episode_count += 1
-                    map_counts[current_map['name']] += 1
-                    
-                    current_map = map_pool[rng.integers(len(map_pool))]
-                    env = current_map['env']
                     start_pose = current_map['start_pose']
-                    randomizer.randomize(env)
+
+                randomizer.randomize(env)
 
                     if hasattr(env, '_has_reset'): env._has_reset = True
                     elif hasattr(env, 'env') and hasattr(env.env, '_has_reset'): env.env._has_reset = True

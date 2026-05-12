@@ -29,10 +29,12 @@ MAP_START_POSES = {
     'vegas':          [0.0, 0.0, 0.0],
     'skirk':          [0.0, 0.0, 0.0],
     'levine':         [0.0, 0.0, 0.0],
+    'levine_2nd':     [0.0, 0.0, 0.0],
 }
 
 MAP_EXTENSIONS = {
     'levine': '.pgm',
+    'levine_2nd': '.pgm',
 }
 
 def discover_maps():
