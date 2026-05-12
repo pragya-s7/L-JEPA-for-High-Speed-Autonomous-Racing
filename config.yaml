@@ -1,7 +1,7 @@
 # L-JEPA Configuration
 
 gym:
-  gym_path: /home/pragya/f1tenth_gym
+  gym_path: ./f1tenth_gym
   timestep: 0.01
   integrator: RK4
   num_beams: 1080
@@ -9,12 +9,12 @@ gym:
 
 maps:
   - name: levine_2nd
-    map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/levine_2nd
+    map_path: ./levine_2nd
     map_ext: .pgm
     start_pose: [0.0, 0.0, 0.0]
 
 data_collection:
-  output_dir: /home/pragya/ljepa/data
+  output_dir: ./data
   episodes_per_map: 20
   max_steps_per_episode: 3000
   context_window: 4
@@ -47,12 +47,12 @@ pretrain:
   weight_decay: 1.0e-5
   ema_decay: 0.996
   prediction_horizon: 30
-  checkpoint_dir: /home/pragya/ljepa/checkpoints/pretrain
+  checkpoint_dir: ./checkpoints/pretrain
   log_every: 10
 
 rl:
-  checkpoint_dir: /home/pragya/ljepa/checkpoints/rl
-  encoder_checkpoint: /home/pragya/ljepa/checkpoints/pretrain/best.pt
+  checkpoint_dir: ./checkpoints/rl
+  encoder_checkpoint: ./checkpoints/pretrain/best.pt
   total_steps: 10_000_000
   rollout_steps: 2048
   num_envs: 1
@@ -68,7 +68,7 @@ rl:
   log_every: 5
   eval_every: 20
 
-  centerline_dir: /home/pragya/ljepa/data/centerlines
+  centerline_dir: ./data/centerlines
 
   reward:
     type: dense
@@ -99,13 +99,13 @@ rl:
 
   training_maps:
     - name: levine_2nd
-      map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/levine_2nd
+      map_path: ./levine_2nd
       map_ext: .pgm
       start_pose: [0.0, 0.0, 0.0]
 
 evaluate:
   map_name: levine_2nd
-  map_path: /home/pragya/f1tenth_gym/gym/f110_gym/envs/maps/levine_2nd
+  map_path: ./levine_2nd
   map_ext: .pgm
   start_pose: [0.0, 0.0, 0.0]
   num_episodes: 10

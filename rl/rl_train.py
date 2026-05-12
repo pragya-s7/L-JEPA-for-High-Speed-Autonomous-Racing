@@ -25,7 +25,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-GYM_PATH = '/home/pragya/f1tenth_gym'
+# Resolve GYM_PATH dynamically from config or environment
+GYM_PATH = os.path.abspath(os.path.join(PROJECT_ROOT, 'f1tenth_gym'))
+if not os.path.exists(GYM_PATH):
+    # Fallback to a common location or ask user to set it in config
+    GYM_PATH = '/home/pragya/f1tenth_gym'
+
 if GYM_PATH not in sys.path:
     sys.path.insert(0, os.path.join(GYM_PATH, 'gym'))
 
@@ -385,10 +390,15 @@ def build_map_pool(cfg):
             )
 
     centerline_dir = rl_cfg.get('centerline_dir', '')
+    if centerline_dir.startswith('./'):
+        centerline_dir = os.path.join(PROJECT_ROOT, centerline_dir[2:])
 
     pool = []
     for m in training_maps:
         path = m['map_path']
+        if path.startswith('./'):
+            path = os.path.join(PROJECT_ROOT, path[2:])
+        
         ext  = m.get('map_ext', '.png')
         if not os.path.exists(path + ext):
             print(f"  [SKIP] map not found: {path}{ext}")
@@ -452,6 +462,8 @@ def train(cfg_path, encoder_path_override=None):
     )
 
     checkpoint_dir = rl_cfg['checkpoint_dir']
+    if checkpoint_dir.startswith('./'):
+        checkpoint_dir = os.path.join(PROJECT_ROOT, checkpoint_dir[2:])
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     randomizer = DomainRandomizer(rl_cfg)
