@@ -7,8 +7,9 @@
  - Qikai Shen | GitHub: qikais-ac
 
 ### Demo Video
-https://youtube.com/shorts/AudgXsTIlX4
-https://youtube.com/shorts/KV5V8AaO_w0
+- https://youtube.com/shorts/AudgXsTIlX4
+
+- https://youtube.com/shorts/KV5V8AaO_w0
 ### Brief Overview
 
 **Problem and Motivation**
