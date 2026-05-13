@@ -6,10 +6,16 @@
  - Manasa Dendukuri | GitHub: maniden | LinkedIn: https://www.linkedin.com/in/manasadendukuri/
  - Qikai Shen | GitHub: qikais-ac
 
-### Demo Video
+### Links
+
+Videos:
 - https://youtube.com/shorts/AudgXsTIlX4
 
 - https://youtube.com/shorts/KV5V8AaO_w0
+
+
+Final Report: https://www.overleaf.com/read/hkbkxzsxbkwd#ecb623
+
 ### Brief Overview
 
 **Problem and Motivation**
@@ -72,10 +78,7 @@ Root cause being encoder gap, reward sparsity at that corner, or training distri
 
 Phase 1 under best conditions (centerline spawn, no DR, deterministic): **37.6% mean lap rate, 50% peak**. Among episodes with at least one lap completion, mean forward progress is ~38.6 m for Phase 1 and ~17.9 m for Phase 2.
 
-The near-100% collision rate is expected as the only termination conditions are collision and step timeout, so the car drives until it hits something regardless of performance. What matters is how far it gets first.
-
-![RL training curves](checkpoints/rl_levine_2nd_phase2/loss_curve.png)
-*Phase 2 training (2.5M → 5M steps). Value loss adjusts to the new reward structure; policy loss stays near zero.*
+The near-100% collision rate is expected as the only termination conditions are collision and step timeout, so the car drives until it hits something regardless of performance. What matters is how far it gets first
 
 **Hardware Deployment**
 
